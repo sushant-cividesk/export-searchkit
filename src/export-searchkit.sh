@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # @describe Export CiviCRM Afform, SavedSearch, and SearchDisplay artifacts into a target extension.
-# @meta version 2.2.0
+# @meta version 1.0.0
 # @meta require-tools bash,php,cv,civix,find,sed,sort
 # @meta inherit-flag-options
 
