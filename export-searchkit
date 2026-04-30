@@ -1,0 +1,1775 @@
+#!/usr/bin/env bash
+# @describe Export CiviCRM Afform, SavedSearch, and SearchDisplay artifacts into a target extension.
+# @meta version 2.2.0
+# @meta require-tools bash,php,cv,civix,find,sed,sort
+# @meta inherit-flag-options
+
+# @option --ext <PATH> Target extension root, or any path inside the target extension.
+# @flag --dry-run Print commands without executing.
+# @flag -v --verbose Show basic progress/info logs.
+# @flag --debug Show debug logs and save API JSON dumps. Also available as -vv.
+# @flag --trace Enable shell tracing. Also available as -vvv.
+# @flag --keep-tmp Keep temp files after exit.
+# @flag --no-strict Continue after export failures.
+# @flag -y --yes Answer yes to prompts.
+# @flag -i --interactive Choose extension interactively and export discovered artifacts.
+
+# @cmd Scan extension and export discovered Afform/SearchKit artifacts.
+# @arg path <PATH> Path inside extension.
+scan() {
+  local path="${argc_path:-${argc_ext:-.}}"
+
+  init_runtime
+  resolve_ext "$path"
+  preflight
+  discover "$EXT" "$ITEMS_FILE"
+
+  say "Extension: $EXT"
+  print_items "$ITEMS_FILE"
+  export_items_file "$ITEMS_FILE"
+}
+
+# @cmd List discovered artifacts without exporting.
+# @arg path <PATH> Path inside extension.
+list() {
+  local path="${argc_path:-${argc_ext:-.}}"
+
+  init_runtime
+  resolve_ext "$path"
+  preflight
+  discover "$EXT" "$ITEMS_FILE"
+
+  say "Extension: $EXT"
+  print_items "$ITEMS_FILE"
+}
+
+# @cmd Check environment and target extension.
+# @arg path <PATH> Path inside extension.
+doctor() {
+  local path="${argc_path:-${argc_ext:-.}}"
+
+  init_runtime
+  resolve_ext "$path"
+  preflight
+
+  say "export-searchkit OK"
+  say "Extension: $EXT"
+
+  if is_verbose; then
+    say "Log: $LOG_FILE"
+    say "Temp: $TMPBASE"
+  fi
+}
+
+# @cmd Export explicit items into target extension.
+# @arg items* Items: afform:NAME, ss:ID, sd:ID, bare NAME, or bare numeric SavedSearch ID.
+export_items() {
+  init_runtime
+  resolve_ext "${argc_ext:-}"
+  preflight
+
+  [[ "${#argc_items[@]}" -gt 0 ]] || die "export-items requires at least one item"
+
+  say "Extension: $EXT"
+
+  for item in "${argc_items[@]}"; do
+    export_one "$item"
+  done
+
+  say "Done."
+}
+
+# @cmd Choose extension interactively, then export discovered artifacts.
+interactive() {
+  init_runtime
+  preflight
+  choose_ext_interactive
+  discover "$EXT" "$ITEMS_FILE"
+
+  say "Extension: $EXT"
+  print_items "$ITEMS_FILE"
+
+  [[ -s "$ITEMS_FILE" ]] || exit 0
+
+  if [[ "${argc_yes:-0}" != 1 ]]; then
+    read -r -p "Proceed with export? [y/N] " answer
+    [[ "$answer" =~ ^[Yy](es)?$ ]] || {
+      say "Aborted."
+      exit 1
+    }
+  fi
+
+  export_items_file "$ITEMS_FILE"
+}
+
+EXT=""
+TMPBASE=""
+LOG_FILE=""
+ITEMS_FILE=""
+
+say() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+die() { err "Error: $*"; exit 2; }
+
+is_verbose() {
+  [[ "${argc_verbose:-0}" == 1 || "${argc_debug:-0}" == 1 || "${argc_trace:-0}" == 1 ]]
+}
+
+is_debug() {
+  [[ "${argc_debug:-0}" == 1 || "${argc_trace:-0}" == 1 ]]
+}
+
+is_trace() {
+  [[ "${argc_trace:-0}" == 1 ]]
+}
+
+init_runtime() {
+  TMPBASE="${TMPDIR:-/tmp}/export-searchkit.$$.$(date +%s)"
+  mkdir -p "$TMPBASE"
+
+  LOG_FILE="$TMPBASE/run.log"
+  ITEMS_FILE="$TMPBASE/items.txt"
+
+  : > "$LOG_FILE"
+  : > "$ITEMS_FILE"
+
+  is_trace && set -x
+
+  trap cleanup EXIT
+}
+
+cleanup() {
+  if [[ "${argc_keep_tmp:-0}" == 1 || "${argc_debug:-0}" == 1 || "${argc_trace:-0}" == 1 ]]; then
+    err "Debug files kept: $TMPBASE"
+  else
+    rm -rf "$TMPBASE" 2>/dev/null || true
+  fi
+}
+
+q() {
+  printf '%q' "$1"
+}
+
+is_num() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+abs_path() {
+  local input="$1"
+  local d
+  local f
+
+  [[ -n "$input" ]] || input="."
+
+  if [[ -d "$input" ]]; then
+    cd "$input" && pwd
+    return 0
+  fi
+
+  if [[ -f "$input" ]]; then
+    d="$(dirname "$input")"
+    f="$(basename "$input")"
+    cd "$d" && printf '%s/%s\n' "$(pwd)" "$f"
+    return 0
+  fi
+
+  d="$(dirname "$input")"
+  f="$(basename "$input")"
+
+  if [[ -d "$d" ]]; then
+    cd "$d" && printf '%s/%s\n' "$(pwd)" "$f"
+    return 0
+  fi
+
+  printf '%s\n' "$input"
+}
+
+looks_like_ext_root() {
+  local p="$1"
+
+  [[ -d "$p" ]] || return 1
+
+  [[ -f "$p/info.xml" ]] && return 0
+  [[ -d "$p/ang" ]] && return 0
+  [[ -d "$p/managed" ]] && return 0
+
+  return 1
+}
+
+find_ext_root() {
+  local p="$1"
+  local parent
+
+  [[ -f "$p" ]] && p="$(dirname "$p")"
+
+  while :; do
+    if looks_like_ext_root "$p"; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+
+    parent="$(dirname "$p")"
+
+    if [[ "$parent" == "$p" ]]; then
+      return 1
+    fi
+
+    p="$parent"
+  done
+}
+
+resolve_ext() {
+  local hint="$1"
+  local abs
+  local root
+
+  [[ -n "$hint" ]] || die "provide --ext PATH or a PATH inside the target extension"
+
+  abs="$(abs_path "$hint")"
+  root="$(find_ext_root "$abs" || true)"
+
+  [[ -n "$root" ]] || die "could not find extension root by walking up from: $abs"
+
+  EXT="$root"
+
+  if [[ ! -f "$EXT/info.xml" ]]; then
+    is_verbose && err "INFO no info.xml found; accepting dev/test extension root because ang/ or managed/ exists: $EXT"
+  fi
+
+  is_verbose && err "INFO target extension: $EXT"
+}
+
+preflight() {
+  command -v php >/dev/null || die "missing php"
+  command -v cv >/dev/null || die "missing cv"
+  command -v civix >/dev/null || die "missing civix"
+
+  if [[ "${argc_dry_run:-0}" != 1 ]]; then
+    cv api4 System.get --quiet >/dev/null 2>&1 || {
+      err "cv cannot reach CiviCRM. Try: cv api4 System.get"
+      exit 3
+    }
+  fi
+
+  is_verbose && err "INFO preflight OK"
+}
+
+run_cmd() {
+  say "+ $*"
+  printf '%s\n' "+ $*" >> "$LOG_FILE"
+
+  [[ "${argc_dry_run:-0}" == 1 ]] && return 0
+
+  bash -lc "$*" >> "$LOG_FILE" 2>&1
+}
+
+fail_or_warn() {
+  if [[ "${argc_no_strict:-0}" == 1 ]]; then
+    err "Warning: $*"
+  else
+    err "$*"
+    err "Log: $LOG_FILE"
+    exit 4
+  fi
+}
+
+extract_managed_names() {
+  local entity="$1"
+  local mgd="$2"
+  local f
+
+  [[ -d "$mgd" ]] || return 0
+
+  while IFS= read -r f; do
+    php -r '
+      $file = $argv[1];
+      $want = $argv[2];
+
+      $data = @include $file;
+
+      if (!is_array($data)) {
+        exit(0);
+      }
+
+      foreach ($data as $item) {
+        if (!is_array($item)) {
+          continue;
+        }
+
+        if (($item["entity"] ?? null) !== $want) {
+          continue;
+        }
+
+        $name = $item["params"]["name"] ?? null;
+
+        if (is_string($name) && $name !== "") {
+          echo $name, PHP_EOL;
+        }
+      }
+    ' "$f" "$entity" 2>/dev/null || true
+  done < <(
+    find "$mgd" -maxdepth 1 -type f -name '*.mgd.php' | sort
+  )
+}
+
+api4_id_by_name() {
+  local entity="$1"
+  local name="$2"
+  local json
+  local safe
+
+  json="$(
+    cv api4 "${entity}.get" \
+      select='["id"]' \
+      where='[["name","=","'"$name"'"]]' \
+      --quiet 2>/dev/null || true
+  )"
+
+  if is_debug; then
+    safe="$(printf '%s' "$name" | tr '/ ' '__' | tr -cd 'A-Za-z0-9_.-')"
+    printf '%s' "$json" > "$TMPBASE/${entity}_${safe}.json" || true
+  fi
+
+  [[ -n "$json" ]] || return 0
+
+  php -r '
+    $d = json_decode($argv[1], true);
+    echo is_array($d) && isset($d[0]["id"]) ? $d[0]["id"] : "";
+  ' "$json" 2>/dev/null || true
+}
+
+discover_afforms() {
+  local ang="$1"
+  local out="$2"
+  local f
+  local name
+
+  [[ -d "$ang" ]] || return 0
+
+  while IFS= read -r f; do
+    name="$(basename "$f")"
+    name="${name%.aff.php}"
+    name="${name%.aff.html}"
+
+    [[ -n "$name" ]] && printf 'afform:%s\n' "$name" >> "$out"
+  done < <(
+    find "$ang" -maxdepth 1 -type f \( -name '*.aff.php' -o -name '*.aff.html' \) | sort
+  )
+}
+
+discover_saved_searches() {
+  local mgd="$1"
+  local out="$2"
+  local name
+
+  [[ -d "$mgd" ]] || return 0
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && printf 'ss-name:%s\n' "$name" >> "$out"
+  done < <(
+    extract_managed_names SavedSearch "$mgd" | sort -u
+  )
+}
+
+discover_search_displays() {
+  local mgd="$1"
+  local out="$2"
+  local name
+
+  [[ -d "$mgd" ]] || return 0
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && printf 'sd-name:%s\n' "$name" >> "$out"
+  done < <(
+    extract_managed_names SearchDisplay "$mgd" | sort -u
+  )
+}
+
+discover() {
+  local root="$1"
+  local out="$2"
+  local ang="$root/ang"
+  local mgd="$root/managed"
+
+  : > "$out"
+
+  if is_debug; then
+    err "DEBUG root=$root"
+    err "DEBUG ang=$ang exists=$([[ -d "$ang" ]] && echo yes || echo no)"
+    err "DEBUG mgd=$mgd exists=$([[ -d "$mgd" ]] && echo yes || echo no)"
+  fi
+
+  discover_afforms "$ang" "$out"
+  discover_saved_searches "$mgd" "$out"
+  discover_search_displays "$mgd" "$out"
+
+  if is_debug; then
+    err "DEBUG discovered file=$out"
+    sed 's/^/DEBUG item=/' "$out" >&2 || true
+  fi
+}
+
+print_items() {
+  local file="$1"
+
+  if [[ ! -s "$file" ]]; then
+    say "No artifacts found."
+    return 0
+  fi
+
+  say "Artifacts:"
+  sed 's/^/  - /' "$file"
+}
+
+export_items_file() {
+  local file="$1"
+  local item
+
+  [[ -s "$file" ]] || return 0
+
+  while IFS= read -r item; do
+    [[ -n "$item" ]] && export_one "$item"
+  done < "$file"
+
+  say "Done."
+}
+
+export_one() {
+  local item="$1"
+  local val
+  local id
+
+  case "$item" in
+    afform:*)
+      val="${item#afform:}"
+      run_cmd "cd $(q "$EXT") && civix export Afform $(q "$val")" \
+        || fail_or_warn "Afform export failed: $val"
+      ;;
+
+    ss:*)
+      val="${item#ss:}"
+      is_num "$val" || fail_or_warn "Invalid SavedSearch ID: $val"
+
+      run_cmd "cd $(q "$EXT") && civix export SavedSearch $(q "$val")" \
+        || fail_or_warn "SavedSearch export failed: $val"
+      ;;
+
+    sd:*)
+      val="${item#sd:}"
+      is_num "$val" || fail_or_warn "Invalid SearchDisplay ID: $val"
+
+      run_cmd "cd $(q "$EXT") && civix export SearchDisplay $(q "$val")" \
+        || fail_or_warn "SearchDisplay export failed: $val"
+      ;;
+
+    ss-name:*)
+      val="${item#ss-name:}"
+      id="$(api4_id_by_name SavedSearch "$val")"
+
+      [[ -n "$id" ]] || fail_or_warn "SavedSearch not found in DB: $val"
+      [[ -n "$id" ]] && export_one "ss:$id"
+      ;;
+
+    sd-name:*)
+      val="${item#sd-name:}"
+      id="$(api4_id_by_name SearchDisplay "$val")"
+
+      [[ -n "$id" ]] || fail_or_warn "SearchDisplay not found in DB: $val"
+      [[ -n "$id" ]] && export_one "sd:$id"
+      ;;
+
+    *)
+      if is_num "$item"; then
+        export_one "ss:$item"
+      else
+        export_one "afform:$item"
+      fi
+      ;;
+  esac
+}
+
+ext_key_from_cv_ext_list_line() {
+  local line="$1"
+  local key=""
+
+  key="$(printf '%s\n' "$line" | awk '{print $1}')"
+
+  [[ -n "$key" ]] || return 1
+  [[ "$key" == "Key" ]] && return 1
+  [[ "$key" == "---" ]] && return 1
+  [[ "$key" == *":"* ]] && return 1
+
+  printf '%s\n' "$key"
+}
+
+list_ext_keys() {
+  cv ext:list 2>/dev/null | while IFS= read -r line; do
+    ext_key_from_cv_ext_list_line "$line" || true
+  done | sort -u
+}
+
+choose_ext_interactive() {
+  local keys_file="$TMPBASE/ext-keys.txt"
+  local paths_file="$TMPBASE/ext-paths.txt"
+  local key
+  local path
+  local idx=0
+  local choice
+
+  : > "$keys_file"
+  : > "$paths_file"
+
+  list_ext_keys > "$keys_file"
+
+  [[ -s "$keys_file" ]] || die "could not read extension list from: cv ext:list"
+
+  say "Available extensions:"
+  say ""
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+
+    path="$(cv path -d "$key" 2>/dev/null || true)"
+
+    if [[ -n "$path" && -d "$path" ]]; then
+      idx=$((idx + 1))
+      printf '%s\t%s\t%s\n' "$idx" "$key" "$path" >> "$paths_file"
+      printf '  %3d) %-45s %s\n' "$idx" "$key" "$path"
+    fi
+  done < "$keys_file"
+
+  [[ -s "$paths_file" ]] || die "no extensions from cv ext:list resolved to filesystem paths via cv path -d"
+
+  say ""
+  read -r -p "Choose extension number: " choice
+
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "invalid choice: $choice"
+
+  key="$(awk -F '\t' -v n="$choice" '$1 == n {print $2}' "$paths_file")"
+  path="$(awk -F '\t' -v n="$choice" '$1 == n {print $3}' "$paths_file")"
+
+  [[ -n "$key" && -n "$path" ]] || die "invalid choice: $choice"
+
+  EXT="$path"
+
+  say ""
+  say "Selected extension: $key"
+  say "Path: $EXT"
+  say ""
+}
+
+normalize_argv() {
+  local out=()
+  local arg
+  local saw_command=0
+
+  for arg in "$@"; do
+    case "$arg" in
+      -vv)
+        out+=(--debug)
+        ;;
+      -vvv|-vvvv*)
+        out+=(--trace)
+        ;;
+      -i|--interactive)
+        out+=(interactive)
+        saw_command=1
+        ;;
+      scan|list|doctor|export_items|export-items|interactive)
+        out+=("$arg")
+        saw_command=1
+        ;;
+      *)
+        out+=("$arg")
+        ;;
+    esac
+  done
+
+  if [[ "${#out[@]}" -eq 0 ]]; then
+    out+=(--help)
+  elif [[ "$saw_command" -eq 0 ]]; then
+    out+=(--help)
+  fi
+
+  set -- "${out[@]}"
+# ARGC-BUILD {
+# This block was generated by argc (https://github.com/sigoden/argc).
+# Modifying it manually is not recommended
+
+_argc_run() {
+    if [[ "${1:-}" == "___internal___" ]]; then
+        _argc_die "error: unsupported ___internal___ command"
+    fi
+    if [[ "${OS:-}" == "Windows_NT" ]] && [[ -n "${MSYSTEM:-}" ]]; then
+        set -o igncr
+    fi
+    argc__args=("$(basename "$0" .sh)" "$@")
+    argc__positionals=()
+    _argc_index=1
+    _argc_len="${#argc__args[@]}"
+    _argc_tools=()
+    _argc_parse
+    _argc_require_tools "${_argc_tools[@]}"
+    if [ -n "${argc__fn:-}" ]; then
+        $argc__fn "${argc__positionals[@]}"
+    fi
+}
+
+_argc_usage() {
+    cat <<-'EOF'
+Export CiviCRM Afform, SavedSearch, and SearchDisplay artifacts into a target extension.
+
+USAGE: export-searchkit [OPTIONS] <COMMAND>
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help         Print help
+  -V, --version      Print version
+
+COMMANDS:
+  scan          Scan extension and export discovered Afform/SearchKit artifacts.
+  list          List discovered artifacts without exporting.
+  doctor        Check environment and target extension.
+  export_items  Export explicit items into target extension. [aliases: export-items]
+  interactive   Choose extension interactively, then export discovered artifacts.
+EOF
+    exit
+}
+
+_argc_version() {
+    echo export-searchkit 2.2.0
+    exit
+}
+
+_argc_parse() {
+    local _argc_key _argc_action
+    local _argc_subcmds="scan, list, doctor, export_items, export-items, interactive"
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage
+            ;;
+        --version | -version | -V)
+            _argc_version
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        scan)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_scan
+            break
+            ;;
+        list)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_list
+            break
+            ;;
+        doctor)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_doctor
+            break
+            ;;
+        export_items | export-items)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_export_items
+            break
+            ;;
+        interactive)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_interactive
+            break
+            ;;
+        help)
+            local help_arg="${argc__args[$((_argc_index + 1))]:-}"
+            case "$help_arg" in
+            scan)
+                _argc_usage_scan
+                ;;
+            list)
+                _argc_usage_list
+                ;;
+            doctor)
+                _argc_usage_doctor
+                ;;
+            export_items | export-items)
+                _argc_usage_export_items
+                ;;
+            interactive)
+                _argc_usage_interactive
+                ;;
+            "")
+                _argc_usage
+                ;;
+            *)
+                _argc_die "error: invalid value \`$help_arg\` for \`<command>\`"$'\n'"  [possible values: $_argc_subcmds]"
+                ;;
+            esac
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            _argc_die "error: \`export-searchkit\` requires a subcommand but one was not provided"$'\n'"  [subcommands: $_argc_subcmds]"
+            ;;
+        esac
+    done
+    _argc_tools=(bash php cv civix find sed sort)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        _argc_usage
+    fi
+}
+
+_argc_usage_scan() {
+    cat <<-'EOF'
+Scan extension and export discovered Afform/SearchKit artifacts.
+
+USAGE: export-searchkit scan [OPTIONS] [PATH]
+
+ARGS:
+  [PATH]  Path inside extension.
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_scan() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_scan
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php cv civix find sed sort)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=scan
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_scan
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_path="${argc__positionals[values_index]}"
+        fi
+    fi
+}
+
+_argc_usage_list() {
+    cat <<-'EOF'
+List discovered artifacts without exporting.
+
+USAGE: export-searchkit list [OPTIONS] [PATH]
+
+ARGS:
+  [PATH]  Path inside extension.
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_list() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_list
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php cv civix find sed sort)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=list
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_list
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_path="${argc__positionals[values_index]}"
+        fi
+    fi
+}
+
+_argc_usage_doctor() {
+    cat <<-'EOF'
+Check environment and target extension.
+
+USAGE: export-searchkit doctor [OPTIONS] [PATH]
+
+ARGS:
+  [PATH]  Path inside extension.
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_doctor() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_doctor
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php cv civix find sed sort)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=doctor
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_doctor
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_path="${argc__positionals[values_index]}"
+        fi
+    fi
+}
+
+_argc_usage_export_items() {
+    cat <<-'EOF'
+Export explicit items into target extension.
+
+USAGE: export-searchkit export_items [OPTIONS] [ITEMS]...
+
+ARGS:
+  [ITEMS]...  Items: afform:NAME, ss:ID, sd:ID, bare NAME, or bare numeric SavedSearch ID.
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_export_items() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_export_items
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php cv civix find sed sort)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=export_items
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_export_items
+        fi
+        _argc_match_positionals 1
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_items=("${argc__positionals[@]:values_index:values_size}")
+        fi
+    fi
+}
+
+_argc_usage_interactive() {
+    cat <<-'EOF'
+Choose extension interactively, then export discovered artifacts.
+
+USAGE: export-searchkit interactive [OPTIONS]
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_interactive() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_interactive
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php cv civix find sed sort)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=interactive
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_interactive
+        fi
+    fi
+}
+
+_argc_take_args() {
+    _argc_take_args_values=()
+    _argc_take_args_len=0
+    local param="$1" min="$2" max="$3" signs="$4" delimiter="$5"
+    if [[ "$min" -eq 0 ]] && [[ "$max" -eq 0 ]]; then
+        return
+    fi
+    local _argc_take_index=$((_argc_index + 1)) _argc_take_value
+    if [[ "$_argc_item" == *=* ]]; then
+        _argc_take_args_values=("${_argc_item##*=}")
+    else
+        while [[ $_argc_take_index -lt $_argc_len ]]; do
+            _argc_take_value="${argc__args[_argc_take_index]}"
+            if _argc_maybe_flag_option "$signs" "$_argc_take_value"; then
+                if [[ "${#_argc_take_value}" -gt 1 ]]; then
+                    break
+                fi
+            fi
+            _argc_take_args_values+=("$_argc_take_value")
+            _argc_take_args_len=$((_argc_take_args_len + 1))
+            if [[ "$_argc_take_args_len" -ge "$max" ]]; then
+                break
+            fi
+            _argc_take_index=$((_argc_take_index + 1))
+        done
+    fi
+    if [[ "${#_argc_take_args_values[@]}" -lt "$min" ]]; then
+        _argc_die "error: incorrect number of values for \`$param\`"
+    fi
+    if [[ -n "$delimiter" ]] && [[ "${#_argc_take_args_values[@]}" -gt 0 ]]; then
+        local item values arr=()
+        for item in "${_argc_take_args_values[@]}"; do
+            IFS="$delimiter" read -r -a values <<<"$item"
+            arr+=("${values[@]}")
+        done
+        _argc_take_args_values=("${arr[@]}")
+    fi
+}
+
+_argc_match_positionals() {
+    _argc_match_positionals_values=()
+    _argc_match_positionals_len=0
+    local params=("$@")
+    local args_len="${#argc__positionals[@]}"
+    if [[ $args_len -eq 0 ]]; then
+        return
+    fi
+    local params_len=$# arg_index=0 param_index=0
+    while [[ $param_index -lt $params_len && $arg_index -lt $args_len ]]; do
+        local takes=0
+        if [[ "${params[param_index]}" -eq 1 ]]; then
+            if [[ $param_index -eq 0 ]] &&
+                [[ ${_argc_dash:-} -gt 0 ]] &&
+                [[ $params_len -eq 2 ]] &&
+                [[ "${params[$((param_index + 1))]}" -eq 1 ]] \
+                ; then
+                takes=${_argc_dash:-}
+            else
+                local arg_diff=$((args_len - arg_index)) param_diff=$((params_len - param_index))
+                if [[ $arg_diff -gt $param_diff ]]; then
+                    takes=$((arg_diff - param_diff + 1))
+                else
+                    takes=1
+                fi
+            fi
+        else
+            takes=1
+        fi
+        _argc_match_positionals_values+=("$arg_index:$takes")
+        arg_index=$((arg_index + takes))
+        param_index=$((param_index + 1))
+    done
+    if [[ $arg_index -lt $args_len ]]; then
+        _argc_match_positionals_values+=("$arg_index:$((args_len - arg_index))")
+    fi
+    _argc_match_positionals_len=${#_argc_match_positionals_values[@]}
+    if [[ $params_len -gt 0 ]] && [[ $_argc_match_positionals_len -gt $params_len ]]; then
+        local index="${_argc_match_positionals_values[params_len]%%:*}"
+        _argc_die "error: unexpected argument \`${argc__positionals[index]}\` found"
+    fi
+}
+
+_argc_maybe_flag_option() {
+    local signs="$1" arg="$2"
+    if [[ -z "$signs" ]]; then
+        return 1
+    fi
+    local cond=false
+    if [[ "$signs" == *"+"* ]]; then
+        if [[ "$arg" =~ ^\+[^+].* ]]; then
+            cond=true
+        fi
+    elif [[ "$arg" == -* ]]; then
+        if (( ${#arg} < 3 )) || [[ ! "$arg" =~ ^---.* ]]; then
+            cond=true
+        fi
+    fi
+    if [[ "$cond" == "false" ]]; then
+        return 1
+    fi
+    local value="${arg%%=*}"
+    if [[ "$value" =~ [[:space:]] ]]; then
+        return 1
+    fi
+    return 0
+}
+
+_argc_require_tools() {
+    local tool missing_tools=()
+    for tool in "$@"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing_tools+=("$tool")
+        fi
+    done
+    if [[ "${#missing_tools[@]}" -gt 0 ]]; then
+        echo "error: missing tools: ${missing_tools[*]}" >&2
+        exit 1
+    fi
+}
+
+_argc_die() {
+    if [[ $# -eq 0 ]]; then
+        cat
+    else
+        echo "$*" >&2
+    fi
+    exit 1
+}
+
+_argc_run "$@"
+
+# ARGC-BUILD }
+}
+
+normalize_argv "$@"

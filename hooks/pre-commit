@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "Running export-searchkit build check..."
+
+./build.sh
+
+git add export-searchkit
+
+echo "export-searchkit rebuilt and staged."
