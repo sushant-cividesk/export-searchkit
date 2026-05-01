@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+
+    if: startsWith(github.event.head_commit.message, 'release:')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install argc
+        run: |
+          curl -fsSL https://github.com/sigoden/argc/releases/latest/download/argc-x86_64-unknown-linux-musl.tar.gz -o argc.tar.gz
+          tar -xzf argc.tar.gz
+          sudo install -m 0755 argc /usr/local/bin/argc
+          argc --version
+
+      - name: Build export-searchkit
+        run: |
+          chmod +x build.sh src/export-searchkit.sh
+          ./build.sh
+          test -x export-searchkit
+
+      - name: Determine next version
+        id: version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git fetch --tags
+
+          latest_tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+
+          if [[ -z "$latest_tag" ]]; then
+            next_tag="v1.0.0"
+          else
+            version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "$version"
+            patch=$((patch + 1))
+            next_tag="v${major}.${minor}.${patch}"
+          fi
+
+          echo "next_tag=$next_tag" >> "$GITHUB_OUTPUT"
+          echo "Next release: $next_tag"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.next_tag }}
+          name: ${{ steps.version.outputs.next_tag }}
+          body: |
+            Automated release from commit:
+
+            ${{ github.event.head_commit.message }}
+          files: |
+            export-searchkit
