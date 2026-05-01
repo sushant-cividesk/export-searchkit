@@ -44,39 +44,43 @@ jobs:
       - name: Determine next version
         id: version
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
 
-          git fetch --tags
-
           msg="${{ github.event.head_commit.message }}"
 
-          latest_tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+          latest_tag="$(
+            gh release list \
+              --limit 100 \
+              --json tagName,isDraft,isPrerelease \
+              --jq '[.[] | select(.isDraft == false and .isPrerelease == false) | .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0]' \
+              || true
+          )"
 
-          if [[ -z "$latest_tag" ]]; then
-            major=1
-            minor=0
-            patch=0
+          if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+            next_tag="v1.0.0"
           else
             version="${latest_tag#v}"
             IFS='.' read -r major minor patch <<< "$version"
-          fi
 
-          if [[ "$msg" == release:* || "$msg" == release\ :* ]]; then
-            major=$((major + 1))
-            minor=0
-            patch=0
-          elif [[ "$msg" == major-release:* || "$msg" == major-release\ :* ]]; then
-            minor=$((minor + 1))
-            patch=0
-          elif [[ "$msg" == minor-release:* || "$msg" == minor-release\ :* ]]; then
-            patch=$((patch + 1))
-          else
-            echo "No release trigger found."
-            exit 1
-          fi
+            if [[ "$msg" == release:* || "$msg" == release\ :* ]]; then
+              major=$((major + 1))
+              minor=0
+              patch=0
+            elif [[ "$msg" == major-release:* || "$msg" == major-release\ :* ]]; then
+              minor=$((minor + 1))
+              patch=0
+            elif [[ "$msg" == minor-release:* || "$msg" == minor-release\ :* ]]; then
+              patch=$((patch + 1))
+            else
+              echo "No release trigger found."
+              exit 1
+            fi
 
-          next_tag="v${major}.${minor}.${patch}"
+            next_tag="v${major}.${minor}.${patch}"
+          fi
 
           echo "next_tag=$next_tag" >> "$GITHUB_OUTPUT"
           echo "Next release: $next_tag"

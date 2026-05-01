@@ -4,6 +4,22 @@ A self-contained Bash CLI to **discover and export CiviCRM SearchKit artifacts**
 
 The final built script is **single-file, dependency-light**, and **does NOT require `argc` at runtime**.
 
+## 🚀 Quick install (no clone needed)
+
+Install latest version directly:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sushant-cividesk/export-searchkit/main/install.sh | bash
+````
+
+This will:
+
+* download latest release
+* install to `/usr/local/bin/export-searchkit`
+* make it executable
+
+Upgrade later by running the same command again.
+
 ## 🚀 What this tool solves
 
 CiviCRM SearchKit packaging normally requires manual commands like:
@@ -12,7 +28,7 @@ CiviCRM SearchKit packaging normally requires manual commands like:
 civix export Afform afformNewServiceRequest
 civix export SavedSearch 64
 civix export SearchDisplay 12
-````
+```
 
 Problems:
 
@@ -45,7 +61,7 @@ Artifacts:
 
 For SavedSearch & SearchDisplay:
 
-* Uses `cv api4` internally
+* Uses `cv api4`
 * Converts:
 
 ```text
@@ -54,8 +70,6 @@ sd-name:Test_Display → sd:12
 ```
 
 ### 3. One-command export
-
-Instead of multiple commands:
 
 ```sh
 export-searchkit scan --ext my-extension
@@ -77,16 +91,14 @@ export-searchkit -i
 
 Flow:
 
-1. Lists all extensions using `cv ext:list`
+1. Lists extensions via `cv ext:list`
 2. Lets you choose extension
 3. Resolves path via `cv path -d`
 4. Scans artifacts
 5. Asks confirmation
 6. Exports everything
 
-### 5. Works with flexible input
-
-You can export using:
+### 5. Flexible input support
 
 ```sh
 export-searchkit export-items --ext my-ext afform:foo
@@ -104,42 +116,25 @@ export-searchkit export-items --ext my-ext 64
 export-searchkit scan --ext my-ext --dry-run
 ```
 
-Output:
-
-```sh
-+ civix export Afform afformNewServiceRequest
-+ civix export SavedSearch 64
-+ civix export SearchDisplay 12
-```
-
 ### 7. Debug & trace modes
 
-| Flag   | Behavior                    |
-| ------ | --------------------------- |
-| `-v`   | Info logs                   |
-| `-vv`  | Debug logs + API dumps      |
-| `-vvv` | Full shell trace (`set -x`) |
-
-Debug files stored in temp dir:
-
-```text
-/tmp/export-searchkit.*
-```
+| Flag   | Behavior               |
+| ------ | ---------------------- |
+| `-v`   | Info logs              |
+| `-vv`  | Debug logs + API dumps |
+| `-vvv` | Full shell trace       |
 
 ### 8. Fail-safe behavior
-
-* Stops on errors by default
-* Optional:
 
 ```sh
 --no-strict
 ```
 
-→ continues even if one export fails
+Continues even if one export fails.
 
 ### 9. Extension auto-detection
 
-You can pass:
+Works with:
 
 ```sh
 --ext path/to/ext
@@ -147,37 +142,13 @@ You can pass:
 --ext path/to/ext/managed/file.php
 ```
 
-Script walks up directories to find extension root.
-
 ## 📦 Commands
-
-### Scan + export
 
 ```sh
 export-searchkit scan --ext PATH
-```
-
-### List only (no export)
-
-```sh
 export-searchkit list --ext PATH
-```
-
-### Export specific items
-
-```sh
-export-searchkit export-items --ext PATH afform:foo ss:64 sd:12
-```
-
-### Interactive mode
-
-```sh
+export-searchkit export-items --ext PATH ...
 export-searchkit -i
-```
-
-### Doctor (environment check)
-
-```sh
 export-searchkit doctor --ext PATH
 ```
 
@@ -185,21 +156,16 @@ export-searchkit doctor --ext PATH
 
 * bash
 * php
-* cv (CiviCRM CLI)
+* cv
 * civix
 
 ## 🛠 Development
 
-Source file:
+Source:
 
 ```text
 src/export-searchkit.sh
 ```
-
-Uses:
-
-* `argc` for CLI parsing (dev only)
-* compiled into single executable
 
 ## 🔨 Build
 
@@ -208,35 +174,20 @@ chmod +x build.sh src/export-searchkit.sh
 ./build.sh
 ```
 
-Output:
-
-```text
-./export-searchkit
-```
-
 ## 🚀 Deployment
-
-Copy built file to any server:
 
 ```sh
 scp export-searchkit server:/usr/local/bin/
 ```
 
-No `argc` required on server.
-
-## 🧠 How it works internally
+## 🧠 How it works
 
 ### Discovery
 
-* Reads filesystem:
-
-  * `ang/` → Afforms
-  * `managed/` → SavedSearch & SearchDisplay
-* Parses `.mgd.php` via PHP runtime
+* `ang/` → Afforms
+* `managed/` → SavedSearch + SearchDisplay
 
 ### Resolution
-
-* Calls:
 
 ```sh
 cv api4 SavedSearch.get
@@ -245,16 +196,28 @@ cv api4 SearchDisplay.get
 
 ### Execution
 
-* Builds commands dynamically
-* Executes via:
-
 ```bash
-bash -lc "civix export ..."
+civix export ...
 ```
 
 ## 🔐 Safety features
 
-* `--dry-run` (no execution)
-* `--keep-tmp` (debug inspection)
+* `--dry-run`
+* `--keep-tmp`
 * strict/non-strict modes
-* input normalization (IDs vs names)
+
+## 📦 Versioning & Releases
+
+Releases are automated via commit messages:
+
+| Commit message   | Result                       |
+| ---------------- | ---------------------------- |
+| `release:`       | major bump (v1 → v2)         |
+| `major-release:` | minor bump (v1.0 → v1.1)     |
+| `minor-release:` | patch bump (v1.0.0 → v1.0.1) |
+
+Example:
+
+```sh
+git commit -m "minor-release: fix export bug"
+```
