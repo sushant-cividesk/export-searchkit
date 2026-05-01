@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # @describe Export CiviCRM Afform, SavedSearch, and SearchDisplay artifacts into a target extension.
 # @meta version 1.0.0
-# @meta require-tools bash,php,cv,civix,find,sed,sort
+# IMPORTANT:
+# Do NOT list cv/civix in require-tools.
+# We resolve them ourselves because many CiviCRM projects keep them in ./vendor/bin.
+# @meta require-tools bash,php,find,sed,sort,awk
 # @meta inherit-flag-options
 
 # @option --ext <PATH> Target extension root, or any path inside the target extension.
@@ -54,6 +57,8 @@ doctor() {
 
   say "export-searchkit OK"
   say "Extension: $EXT"
+  say "cv: $CV_BIN"
+  say "civix: $CIVIX_BIN"
 
   if is_verbose; then
     say "Log: $LOG_FILE"
@@ -106,6 +111,8 @@ EXT=""
 TMPBASE=""
 LOG_FILE=""
 ITEMS_FILE=""
+CV_BIN=""
+CIVIX_BIN=""
 
 say() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -239,19 +246,110 @@ resolve_ext() {
   is_verbose && err "INFO target extension: $EXT"
 }
 
+find_project_root() {
+  local start="${1:-$PWD}"
+  local p
+  local parent
+
+  p="$(abs_path "$start")"
+
+  [[ -f "$p" ]] && p="$(dirname "$p")"
+
+  while :; do
+    if [[ -d "$p/vendor/bin" || -f "$p/composer.json" || -f "$p/private/civicrm.settings.php" ]]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+
+    parent="$(dirname "$p")"
+
+    if [[ "$parent" == "$p" ]]; then
+      return 1
+    fi
+
+    p="$parent"
+  done
+}
+
+resolve_tool_from_project() {
+  local tool="$1"
+  local root=""
+  local candidate=""
+
+  if command -v "$tool" >/dev/null 2>&1; then
+    command -v "$tool"
+    return 0
+  fi
+
+  if [[ -x "./vendor/bin/$tool" ]]; then
+    printf '%s\n' "./vendor/bin/$tool"
+    return 0
+  fi
+
+  root="$(find_project_root "$PWD" || true)"
+  if [[ -n "$root" && -x "$root/vendor/bin/$tool" ]]; then
+    printf '%s\n' "$root/vendor/bin/$tool"
+    return 0
+  fi
+
+  if [[ -n "$EXT" ]]; then
+    candidate="$EXT/../../vendor/bin/$tool"
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+
+    candidate="$EXT/../../../vendor/bin/$tool"
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
 preflight() {
   command -v php >/dev/null || die "missing php"
-  command -v cv >/dev/null || die "missing cv"
-  command -v civix >/dev/null || die "missing civix"
+
+  CV_BIN="$(resolve_tool_from_project cv || true)"
+  CIVIX_BIN="$(resolve_tool_from_project civix || true)"
+
+  if [[ -z "$CV_BIN" ]]; then
+    err "Error: missing tools: cv"
+    err ""
+    err "Could not find cv in PATH or project vendor/bin."
+    err "Run this command from your CiviCRM project root, or add vendor/bin to PATH:"
+    err ""
+    err "  export PATH=\"\$PWD/vendor/bin:\$PATH\""
+    err ""
+    exit 3
+  fi
+
+  if [[ -z "$CIVIX_BIN" ]]; then
+    err "Error: missing tools: civix"
+    err ""
+    err "Could not find civix in PATH or project vendor/bin."
+    err "Run this command from your CiviCRM project root, or add vendor/bin to PATH:"
+    err ""
+    err "  export PATH=\"\$PWD/vendor/bin:\$PATH\""
+    err ""
+    exit 3
+  fi
 
   if [[ "${argc_dry_run:-0}" != 1 ]]; then
-    cv api4 System.get --quiet >/dev/null 2>&1 || {
-      err "cv cannot reach CiviCRM. Try: cv api4 System.get"
+    "$CV_BIN" ext:list >/dev/null 2>&1 || {
+      err "cv cannot reach CiviCRM. Try:"
+      err ""
+      err "  $CV_BIN ext:list"
+      err ""
       exit 3
     }
   fi
 
   is_verbose && err "INFO preflight OK"
+  is_verbose && err "INFO cv: $CV_BIN"
+  is_verbose && err "INFO civix: $CIVIX_BIN"
 }
 
 run_cmd() {
@@ -319,7 +417,7 @@ api4_id_by_name() {
   local safe
 
   json="$(
-    cv api4 "${entity}.get" \
+    "$CV_BIN" api4 "${entity}.get" \
       select='["id"]' \
       where='[["name","=","'"$name"'"]]' \
       --quiet 2>/dev/null || true
@@ -442,7 +540,7 @@ export_one() {
   case "$item" in
     afform:*)
       val="${item#afform:}"
-      run_cmd "cd $(q "$EXT") && civix export Afform $(q "$val")" \
+      run_cmd "cd $(q "$EXT") && $(q "$CIVIX_BIN") export Afform $(q "$val")" \
         || fail_or_warn "Afform export failed: $val"
       ;;
 
@@ -450,7 +548,7 @@ export_one() {
       val="${item#ss:}"
       is_num "$val" || fail_or_warn "Invalid SavedSearch ID: $val"
 
-      run_cmd "cd $(q "$EXT") && civix export SavedSearch $(q "$val")" \
+      run_cmd "cd $(q "$EXT") && $(q "$CIVIX_BIN") export SavedSearch $(q "$val")" \
         || fail_or_warn "SavedSearch export failed: $val"
       ;;
 
@@ -458,7 +556,7 @@ export_one() {
       val="${item#sd:}"
       is_num "$val" || fail_or_warn "Invalid SearchDisplay ID: $val"
 
-      run_cmd "cd $(q "$EXT") && civix export SearchDisplay $(q "$val")" \
+      run_cmd "cd $(q "$EXT") && $(q "$CIVIX_BIN") export SearchDisplay $(q "$val")" \
         || fail_or_warn "SearchDisplay export failed: $val"
       ;;
 
@@ -503,7 +601,7 @@ ext_key_from_cv_ext_list_line() {
 }
 
 list_ext_keys() {
-  cv ext:list 2>/dev/null | while IFS= read -r line; do
+  "$CV_BIN" ext:list 2>/dev/null | while IFS= read -r line; do
     ext_key_from_cv_ext_list_line "$line" || true
   done | sort -u
 }
@@ -521,7 +619,7 @@ choose_ext_interactive() {
 
   list_ext_keys > "$keys_file"
 
-  [[ -s "$keys_file" ]] || die "could not read extension list from: cv ext:list"
+  [[ -s "$keys_file" ]] || die "could not read extension list from: $CV_BIN ext:list"
 
   say "Available extensions:"
   say ""
@@ -529,7 +627,7 @@ choose_ext_interactive() {
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
 
-    path="$(cv path -d "$key" 2>/dev/null || true)"
+    path="$("$CV_BIN" path -d "$key" 2>/dev/null || true)"
 
     if [[ -n "$path" && -d "$path" ]]; then
       idx=$((idx + 1))
@@ -538,7 +636,7 @@ choose_ext_interactive() {
     fi
   done < "$keys_file"
 
-  [[ -s "$paths_file" ]] || die "no extensions from cv ext:list resolved to filesystem paths via cv path -d"
+  [[ -s "$paths_file" ]] || die "no extensions from $CV_BIN ext:list resolved to filesystem paths via $CV_BIN path -d"
 
   say ""
   read -r -p "Choose extension number: " choice
@@ -824,7 +922,7 @@ _argc_parse() {
             ;;
         esac
     done
-    _argc_tools=(bash php cv civix find sed sort)
+    _argc_tools=(bash php find sed sort awk)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
@@ -978,7 +1076,7 @@ _argc_parse_scan() {
             ;;
         esac
     done
-    _argc_tools=(bash php cv civix find sed sort)
+    _argc_tools=(bash php find sed sort awk)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
@@ -1141,7 +1239,7 @@ _argc_parse_list() {
             ;;
         esac
     done
-    _argc_tools=(bash php cv civix find sed sort)
+    _argc_tools=(bash php find sed sort awk)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
@@ -1304,7 +1402,7 @@ _argc_parse_doctor() {
             ;;
         esac
     done
-    _argc_tools=(bash php cv civix find sed sort)
+    _argc_tools=(bash php find sed sort awk)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
@@ -1467,7 +1565,7 @@ _argc_parse_export_items() {
             ;;
         esac
     done
-    _argc_tools=(bash php cv civix find sed sort)
+    _argc_tools=(bash php find sed sort awk)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
@@ -1627,7 +1725,7 @@ _argc_parse_interactive() {
             ;;
         esac
     done
-    _argc_tools=(bash php cv civix find sed sort)
+    _argc_tools=(bash php find sed sort awk)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
