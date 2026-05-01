@@ -25,7 +25,7 @@ jobs:
           repo: sigoden/argc
 
       - name: Check argc
-        run: argc --version
+        run: argc --argc-version
 
       - name: Build export-searchkit
         run: |
