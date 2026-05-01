@@ -13,11 +13,19 @@ jobs:
     name: Build and release
     runs-on: ubuntu-latest
 
-    if: startsWith(github.event.head_commit.message, 'release:')
+    if: |
+      startsWith(github.event.head_commit.message, 'release:') ||
+      startsWith(github.event.head_commit.message, 'release :') ||
+      startsWith(github.event.head_commit.message, 'major-release:') ||
+      startsWith(github.event.head_commit.message, 'major-release :') ||
+      startsWith(github.event.head_commit.message, 'minor-release:') ||
+      startsWith(github.event.head_commit.message, 'minor-release :')
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install argc
         uses: sigoden/install-binary@v1
@@ -41,16 +49,34 @@ jobs:
 
           git fetch --tags
 
+          msg="${{ github.event.head_commit.message }}"
+
           latest_tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
 
           if [[ -z "$latest_tag" ]]; then
-            next_tag="v1.0.0"
+            major=1
+            minor=0
+            patch=0
           else
             version="${latest_tag#v}"
             IFS='.' read -r major minor patch <<< "$version"
-            patch=$((patch + 1))
-            next_tag="v${major}.${minor}.${patch}"
           fi
+
+          if [[ "$msg" == release:* || "$msg" == release\ :* ]]; then
+            major=$((major + 1))
+            minor=0
+            patch=0
+          elif [[ "$msg" == major-release:* || "$msg" == major-release\ :* ]]; then
+            minor=$((minor + 1))
+            patch=0
+          elif [[ "$msg" == minor-release:* || "$msg" == minor-release\ :* ]]; then
+            patch=$((patch + 1))
+          else
+            echo "No release trigger found."
+            exit 1
+          fi
+
+          next_tag="v${major}.${minor}.${patch}"
 
           echo "next_tag=$next_tag" >> "$GITHUB_OUTPUT"
           echo "Next release: $next_tag"
