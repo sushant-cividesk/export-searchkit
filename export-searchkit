@@ -84,12 +84,13 @@ export_items() {
   say "Done."
 }
 
-# @cmd Choose extension interactively, then export discovered artifacts.
+# @cmd Choose extension interactively, then choose artifacts from extension or site.
 interactive() {
   init_runtime
   preflight
   choose_ext_interactive
-  discover "$EXT" "$ITEMS_FILE"
+
+  choose_interactive_export_items "$ITEMS_FILE"
 
   say "Extension: $EXT"
   print_items "$ITEMS_FILE"
@@ -105,6 +106,315 @@ interactive() {
   fi
 
   export_items_file "$ITEMS_FILE"
+}
+
+# @cmd Show common usage examples.
+examples() {
+  cat <<'EOF'
+export-searchkit examples
+
+Basic checks:
+  export-searchkit doctor --ext /var/www/html/ext/advanced-events
+  export-searchkit list --ext /var/www/html/ext/advanced-events
+  export-searchkit scan --dry-run --ext /var/www/html/ext/advanced-events
+
+Export all discovered Afform, SavedSearch, and SearchDisplay artifacts:
+  export-searchkit scan --ext /var/www/html/ext/advanced-events
+
+Export and continue if one item fails:
+  export-searchkit scan --no-strict --ext /var/www/html/ext/advanced-events
+
+Export one Afform:
+  export-searchkit export_items --ext /var/www/html/ext/advanced-events afform:afsearchManageEventTemplates
+
+Export SavedSearch/SearchDisplay by ID:
+  export-searchkit export_items --ext /var/www/html/ext/advanced-events ss:65 ss:66 sd:67 sd:68
+
+Dry-run scan:
+  export-searchkit --dry-run scan --ext /var/www/html/ext/advanced-events
+  export-searchkit scan --dry-run --ext /var/www/html/ext/advanced-events
+
+Dry-run explicit export:
+  export-searchkit --dry-run export_items --ext /var/www/html/ext/advanced-events \
+    afform:afsearchManageEventTemplates ss:65 sd:67
+  export-searchkit export_items --dry-run --ext /var/www/html/ext/advanced-events \
+    afform:afsearchManageEventTemplates ss:65 sd:67
+
+Debug export and keep temp logs:
+  export-searchkit --debug --keep-tmp scan --ext /var/www/html/ext/advanced-events
+
+Trace shell execution:
+  export-searchkit --trace --keep-tmp scan --ext /var/www/html/ext/advanced-events
+
+Interactive extension picker:
+  export-searchkit interactive
+  export-searchkit -i
+
+Interactive picker with auto-confirm:
+  export-searchkit --yes interactive
+
+Interactive picker with site artifact selection:
+  export-searchkit interactive
+  # Then choose:
+  #   1) target extension
+  #   2) discovered artifacts, site Afforms, site SavedSearches, or site SearchDisplays
+  #   3) item number(s), comma-separated, or all
+
+Run built-in smoke tests:
+  export-searchkit self_test --ext /var/www/html/ext/advanced-events
+
+Supported item formats:
+  afform:NAME     Example: afform:afsearchManageEventTemplates
+  ss:ID           Example: ss:65
+  sd:ID           Example: sd:67
+  NAME            Bare non-numeric names are treated as Afform names
+  ID              Bare numeric values are treated as SavedSearch IDs
+
+Notes:
+  --dry-run prints commands without writing files.
+  --debug saves API JSON dumps and extra logs.
+  --trace enables shell tracing.
+  --keep-tmp keeps temp files after the command finishes.
+  --no-strict continues after export failures.
+EOF
+}
+
+interactive_choice_for_path() {
+  local path="$1"
+  local tmp_root="${TMPDIR:-/tmp}"
+  local out="$tmp_root/export-searchkit-choice.$$.out"
+  local choice
+
+  printf '999999\n' | "$0" interactive > "$out" 2>&1 || true
+
+  choice="$(
+    awk -v target="$path" '
+      index($0, target) {
+        gsub(/^[[:space:]]+/, "", $0);
+        split($0, a, ")");
+        print a[1];
+        exit;
+      }
+    ' "$out"
+  )"
+
+  rm -f "$out"
+
+  [[ -n "$choice" ]] || die "self-test failed: could not find interactive choice for path: $path"
+
+  printf '%s\n' "$choice"
+}
+
+# @cmd Run smoke tests for all main commands and options.
+# @arg path <PATH> Path inside extension.
+self_test() {
+  local path="${argc_path:-${argc_ext:-.}}"
+  local tmp_root="${TMPDIR:-/tmp}"
+  local out
+
+  mkdir -p "$tmp_root" || die "cannot create temp directory: $tmp_root"
+  out="$tmp_root/export-searchkit-self-test.$$.out"
+
+  say "Running export-searchkit self-test..."
+  say ""
+
+  say "Test 1: doctor"
+  "$0" doctor --ext "$path" > "$out" 2>&1
+  grep -q 'export-searchkit OK' "$out" || {
+    cat "$out"
+    die "self-test failed: doctor did not report OK"
+  }
+  say "  PASS"
+
+  say "Test 2: list"
+  "$0" list --ext "$path" > "$out" 2>&1
+  grep -q 'Extension:' "$out" || {
+    cat "$out"
+    die "self-test failed: list did not print extension"
+  }
+
+  if grep -E 'Fatal error|thrown in|undefined function|Class .* not found' "$out" >/dev/null; then
+    cat "$out"
+    die "self-test failed: list output contains PHP fatal errors"
+  fi
+
+  if grep -E 'ss-name:[[:space:]]*$|sd-name:[[:space:]]*$' "$out" >/dev/null; then
+    cat "$out"
+    die "self-test failed: list output contains empty SavedSearch/SearchDisplay names"
+  fi
+  say "  PASS"
+
+  say "Test 3: scan --dry-run"
+  "$0" scan --dry-run --ext "$path" > "$out" 2>&1
+  grep -q 'Done.' "$out" || {
+    cat "$out"
+    die "self-test failed: dry-run scan did not complete"
+  }
+  grep -q '+ ' "$out" || {
+    cat "$out"
+    die "self-test failed: dry-run scan did not print commands"
+  }
+  say "  PASS"
+
+  say "Test 4: --debug --keep-tmp scan --dry-run"
+  "$0" --debug --keep-tmp scan --dry-run --ext "$path" > "$out" 2>&1
+  grep -q 'DEBUG' "$out" || {
+    cat "$out"
+    die "self-test failed: debug output missing"
+  }
+  grep -q 'Debug files kept:' "$out" || {
+    cat "$out"
+    die "self-test failed: keep-tmp output missing"
+  }
+  say "  PASS"
+
+  say "Test 5: --trace --keep-tmp scan --dry-run"
+  "$0" --trace --keep-tmp scan --dry-run --ext "$path" > "$out" 2>&1
+  grep -q 'set -x\|+ resolve_ext\|+ preflight' "$out" || {
+    cat "$out"
+    die "self-test failed: trace output missing"
+  }
+  say "  PASS"
+
+  say "Test 6: scan --no-strict --dry-run"
+  "$0" scan --no-strict --dry-run --ext "$path" > "$out" 2>&1
+  grep -q 'Done.' "$out" || {
+    cat "$out"
+    die "self-test failed: no-strict dry-run scan did not complete"
+  }
+  say "  PASS"
+
+  say "Test 7: export_items --dry-run with discovered first item"
+  local first_item
+  first_item="$("$0" list --ext "$path" | awk '/  - / {print $2; exit}')"
+  [[ -n "$first_item" ]] || die "self-test failed: no discovered items found for export_items test"
+
+  "$0" export_items --dry-run --ext "$path" "$first_item" > "$out" 2>&1
+  grep -q 'Done.' "$out" || {
+    cat "$out"
+    die "self-test failed: export_items dry-run did not complete"
+  }
+  say "  PASS"
+
+  say "Test 8: export-items alias"
+  "$0" export-items --dry-run --ext "$path" "$first_item" > "$out" 2>&1
+  grep -q 'Done.' "$out" || {
+    cat "$out"
+    die "self-test failed: export-items alias did not complete"
+  }
+  say "  PASS"
+
+  say "Test 9: examples"
+  "$0" examples > "$out" 2>&1
+  grep -q 'Basic checks:' "$out" || {
+    cat "$out"
+    die "self-test failed: examples output missing"
+  }
+  say "  PASS"
+
+  say "Test 10: help"
+  "$0" --help > "$out" 2>&1
+  grep -q 'COMMANDS:' "$out" || {
+    cat "$out"
+    die "self-test failed: help output missing commands"
+  }
+  grep -q 'examples' "$out" || {
+    cat "$out"
+    die "self-test failed: help output missing examples command"
+  }
+  grep -q 'self_test' "$out" || {
+    cat "$out"
+    die "self-test failed: help output missing self_test command"
+  }
+  say "  PASS"
+
+  say "Test 11: interactive lists filesystem extensions"
+  printf '999999\n' | "$0" interactive > "$out" 2>&1 || true
+  grep -q 'Available extensions:' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive did not print available extensions"
+  }
+  grep -Fq "$path" "$out" || {
+    cat "$out"
+    die "self-test failed: interactive did not list target extension path"
+  }
+  say "  PASS"
+
+  say "Test 12: -i alias lists filesystem extensions"
+  printf '999999\n' | "$0" -i > "$out" 2>&1 || true
+  grep -q 'Available extensions:' "$out" || {
+    cat "$out"
+    die "self-test failed: -i did not print available extensions"
+  }
+  grep -Fq "$path" "$out" || {
+    cat "$out"
+    die "self-test failed: -i did not list target extension path"
+  }
+  say "  PASS"
+
+  local ext_choice
+  ext_choice="$(interactive_choice_for_path "$path")"
+
+  say "Test 13: interactive choose extension then cancel artifact picker"
+  printf '%s\nq\n' "$ext_choice" | "$0" interactive > "$out" 2>&1 || true
+  grep -q 'What do you want to export?' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive did not show export source picker"
+  }
+  say "  PASS"
+
+  say "Test 14: interactive choose discovered artifacts then abort"
+  printf '%s\n1\nn\n' "$ext_choice" | "$0" interactive > "$out" 2>&1 || true
+  grep -q 'Artifacts:' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive discovered artifacts did not list artifacts"
+  }
+  grep -q 'Aborted.' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive discovered artifacts did not abort safely"
+  }
+  say "  PASS"
+
+  say "Test 15: interactive choose site Afform then dry-run"
+  printf '%s\n2\n1\n' "$ext_choice" | "$0" --dry-run --yes interactive > "$out" 2>&1
+  grep -q 'Available Afforms' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive Afform picker missing"
+  }
+  grep -q 'afform:' "$out" || grep -q 'civix export Afform' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive Afform dry-run did not select/export an Afform"
+  }
+  say "  PASS"
+
+  say "Test 16: interactive choose site SavedSearch then dry-run"
+  printf '%s\n3\n1\n' "$ext_choice" | "$0" --dry-run --yes interactive > "$out" 2>&1
+  grep -q 'Available SavedSearches' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive SavedSearch picker missing"
+  }
+  grep -q 'civix export SavedSearch' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive SavedSearch dry-run did not export SavedSearch"
+  }
+  say "  PASS"
+
+  say "Test 17: interactive choose all safe site Afforms and SavedSearches then dry-run"
+  printf '%s\n5\nall\n' "$ext_choice" | "$0" --dry-run --yes interactive > "$out" 2>&1
+  grep -q 'Available Afforms and SavedSearches' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive safe all picker missing"
+  }
+  grep -q 'civix export' "$out" || {
+    cat "$out"
+    die "self-test failed: interactive safe all dry-run did not print export commands"
+  }
+  say "  PASS"
+
+  rm -f "$out"
+
+  say ""
+  say "PASS: all export-searchkit self-tests passed"
 }
 
 EXT=""
@@ -383,25 +693,37 @@ extract_managed_names() {
       $file = $argv[1];
       $want = $argv[2];
 
-      $data = @include $file;
-
-      if (!is_array($data)) {
+      $src = file_get_contents($file);
+      if ($src === false) {
         exit(0);
       }
 
-      foreach ($data as $item) {
-        if (!is_array($item)) {
+      // Strip comments to reduce false positives.
+      $src = preg_replace("!/\\*.*?\\*/!s", "", $src);
+      $src = preg_replace("!//.*!", "", $src);
+
+      // Find blocks that declare the requested entity.
+      $entityPattern = "/[\"\\x27]entity[\"\\x27]\\s*=>\\s*[\"\\x27]" . preg_quote($want, "/") . "[\"\\x27]/";
+
+      if (!preg_match_all($entityPattern, $src, $entityMatches, PREG_OFFSET_CAPTURE)) {
+        exit(0);
+      }
+
+      foreach ($entityMatches[0] as $match) {
+        $pos = $match[1];
+
+        // Look forward from entity declaration for params/name.
+        $chunk = substr($src, $pos, 6000);
+
+        if (preg_match("/[\"\\x27]params[\"\\x27]\\s*=>\\s*\\[/", $chunk) &&
+            preg_match("/[\"\\x27]name[\"\\x27]\\s*=>\\s*[\"\\x27]([^\"\\x27]+)[\"\\x27]/", $chunk, $m)) {
+          echo $m[1], PHP_EOL;
           continue;
         }
 
-        if (($item["entity"] ?? null) !== $want) {
-          continue;
-        }
-
-        $name = $item["params"]["name"] ?? null;
-
-        if (is_string($name) && $name !== "") {
-          echo $name, PHP_EOL;
+        // Some mgd files may put name close to entity without explicit params match.
+        if (preg_match("/[\"\\x27]name[\"\\x27]\\s*=>\\s*[\"\\x27]([^\"\\x27]+)[\"\\x27]/", $chunk, $m)) {
+          echo $m[1], PHP_EOL;
         }
       }
     ' "$f" "$entity" 2>/dev/null || true
@@ -418,9 +740,10 @@ api4_id_by_name() {
 
   json="$(
     "$CV_BIN" api4 "${entity}.get" \
-      select='["id"]' \
+      select='["id","name"]' \
       where='[["name","=","'"$name"'"]]' \
-      --quiet 2>/dev/null || true
+      limit=1 \
+      2>/dev/null || true
   )"
 
   if is_debug; then
@@ -431,8 +754,26 @@ api4_id_by_name() {
   [[ -n "$json" ]] || return 0
 
   php -r '
-    $d = json_decode($argv[1], true);
-    echo is_array($d) && isset($d[0]["id"]) ? $d[0]["id"] : "";
+    $raw = $argv[1];
+    $d = json_decode($raw, true);
+
+    if (!is_array($d)) {
+      exit(0);
+    }
+
+    // cv api4 may return either:
+    // [ {"id": 123, ...} ]
+    // or:
+    // { "values": [ {"id": 123, ...} ] }
+    if (isset($d[0]["id"])) {
+      echo $d[0]["id"];
+      exit(0);
+    }
+
+    if (isset($d["values"][0]["id"])) {
+      echo $d["values"][0]["id"];
+      exit(0);
+    }
   ' "$json" 2>/dev/null || true
 }
 
@@ -444,14 +785,12 @@ discover_afforms() {
 
   [[ -d "$ang" ]] || return 0
 
-  while IFS= read -r f; do
-    name="$(basename "$f")"
-    name="${name%.aff.php}"
-    name="${name%.aff.html}"
-
+  while IFS= read -r name; do
     [[ -n "$name" ]] && printf 'afform:%s\n' "$name" >> "$out"
   done < <(
-    find "$ang" -maxdepth 1 -type f \( -name '*.aff.php' -o -name '*.aff.html' \) | sort
+    find "$ang" -maxdepth 1 -type f \( -name '*.aff.php' -o -name '*.aff.html' \) \
+      | sed -E 's#.*/##; s/\.aff\.(php|html)$//' \
+      | sort -u
   )
 }
 
@@ -475,6 +814,13 @@ discover_search_displays() {
   local name
 
   [[ -d "$mgd" ]] || return 0
+
+  # If SearchDisplays are already embedded inside SavedSearch managed files,
+  # do not separately export them. This prevents duplicate managed definitions.
+  if grep -R "'entity'[[:space:]]*=>[[:space:]]*'SearchDisplay'\|\"entity\"[[:space:]]*=>[[:space:]]*\"SearchDisplay\"" "$mgd"/SavedSearch_*.mgd.php >/dev/null 2>&1; then
+    is_verbose && err "INFO SearchDisplay entities already embedded in SavedSearch managed files; skipping separate SearchDisplay discovery"
+    return 0
+  fi
 
   while IFS= read -r name; do
     [[ -n "$name" ]] && printf 'sd-name:%s\n' "$name" >> "$out"
@@ -522,14 +868,22 @@ print_items() {
 export_items_file() {
   local file="$1"
   local item
+  local before="$TMPBASE/files-before.txt"
+  local after="$TMPBASE/files-after.txt"
 
   [[ -s "$file" ]] || return 0
+
+  snapshot_files "$before"
 
   while IFS= read -r item; do
     [[ -n "$item" ]] && export_one "$item"
   done < "$file"
 
   say "Done."
+
+  if [[ "${argc_dry_run:-0}" != 1 ]]; then
+    show_changed_since_snapshot "$before" "$after"
+  fi
 }
 
 export_one() {
@@ -562,6 +916,13 @@ export_one() {
 
     ss-name:*)
       val="${item#ss-name:}"
+
+      if [[ "${argc_dry_run:-0}" == 1 ]]; then
+        say "+ would resolve SavedSearch name: $(q "$val")"
+        say "+ would export SavedSearch after DB lookup"
+        return 0
+      fi
+
       id="$(api4_id_by_name SavedSearch "$val")"
 
       [[ -n "$id" ]] || fail_or_warn "SavedSearch not found in DB: $val"
@@ -570,6 +931,13 @@ export_one() {
 
     sd-name:*)
       val="${item#sd-name:}"
+
+      if [[ "${argc_dry_run:-0}" == 1 ]]; then
+        say "+ would resolve SearchDisplay name: $(q "$val")"
+        say "+ would export SearchDisplay after DB lookup"
+        return 0
+      fi
+
       id="$(api4_id_by_name SearchDisplay "$val")"
 
       [[ -n "$id" ]] || fail_or_warn "SearchDisplay not found in DB: $val"
@@ -606,20 +974,130 @@ list_ext_keys() {
   done | sort -u
 }
 
+find_ext_path_by_key() {
+  local key="$1"
+  local project_root
+  local d
+  local info_key
+
+  project_root="$(find_project_root "$PWD" || true)"
+  [[ -n "$project_root" ]] || return 1
+
+  for d in \
+    "$project_root/ext/$key" \
+    "$project_root/ext/${key//_/-}" \
+    "$project_root/web/sites/default/files/civicrm/ext/$key" \
+    "$project_root/web/sites/default/files/civicrm/ext/${key//_/-}" \
+    "$project_root/sites/default/files/civicrm/ext/$key" \
+    "$project_root/sites/default/files/civicrm/ext/${key//_/-}"
+  do
+    [[ -d "$d" ]] && {
+      printf '%s\n' "$d"
+      return 0
+    }
+  done
+
+  while IFS= read -r d; do
+    [[ -f "$d/info.xml" ]] || continue
+
+    info_key="$(
+      php -r '
+        $file = $argv[1];
+        $xml = @simplexml_load_file($file);
+        if ($xml && isset($xml["key"])) {
+          echo (string) $xml["key"];
+        }
+      ' "$d/info.xml" 2>/dev/null || true
+    )"
+
+    if [[ "$info_key" == "$key" ]]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done < <(
+    find "$project_root" -path '*/vendor' -prune -o -path '*/node_modules' -prune -o -name info.xml -print 2>/dev/null \
+      | sed 's#/info.xml$##'
+  )
+
+  return 1
+}
+
+list_filesystem_extensions() {
+  local project_root="$1"
+  local base
+  local ext_dir
+  local key
+  local name
+
+  for base in \
+    "$project_root/ext" \
+    "$project_root/web/sites/default/files/civicrm/ext" \
+    "$project_root/sites/default/files/civicrm/ext"
+  do
+    [[ -d "$base" ]] || continue
+
+    find "$base" -mindepth 1 -maxdepth 1 -type d | sort | while IFS= read -r ext_dir; do
+      [[ -f "$ext_dir/info.xml" || -d "$ext_dir/managed" || -d "$ext_dir/ang" ]] || continue
+
+      key="$(
+        php -r '
+          $dir = $argv[1];
+          $info = $dir . "/info.xml";
+
+          if (is_file($info)) {
+            $xml = @simplexml_load_file($info);
+            if ($xml && isset($xml["key"])) {
+              echo (string) $xml["key"];
+              exit(0);
+            }
+          }
+
+          echo basename($dir);
+        ' "$ext_dir" 2>/dev/null || basename "$ext_dir"
+      )"
+
+      name="$(
+        php -r '
+          $dir = $argv[1];
+          $info = $dir . "/info.xml";
+
+          if (is_file($info)) {
+            $xml = @simplexml_load_file($info);
+            if ($xml && isset($xml->name)) {
+              echo trim((string) $xml->name);
+              exit(0);
+            }
+          }
+
+          echo basename($dir);
+        ' "$ext_dir" 2>/dev/null || basename "$ext_dir"
+      )"
+
+      printf '%s\t%s\t%s\n' "$key" "$name" "$ext_dir"
+    done
+  done | sort -u
+}
+
 choose_ext_interactive() {
   local keys_file="$TMPBASE/ext-keys.txt"
   local paths_file="$TMPBASE/ext-paths.txt"
+  local fs_file="$TMPBASE/ext-filesystem.txt"
+  local project_root
   local key
+  local name
   local path
   local idx=0
   local choice
 
   : > "$keys_file"
   : > "$paths_file"
+  : > "$fs_file"
 
-  list_ext_keys > "$keys_file"
+  project_root="$(find_project_root "$PWD" || true)"
+  [[ -n "$project_root" ]] || die "could not find CiviCRM project root"
 
-  [[ -s "$keys_file" ]] || die "could not read extension list from: $CV_BIN ext:list"
+  list_ext_keys > "$keys_file" || true
+  list_filesystem_extensions "$project_root" > "$fs_file" || true
 
   say "Available extensions:"
   say ""
@@ -629,6 +1107,10 @@ choose_ext_interactive() {
 
     path="$("$CV_BIN" path -d "$key" 2>/dev/null || true)"
 
+    if [[ -z "$path" || ! -d "$path" ]]; then
+      path="$(find_ext_path_by_key "$key" || true)"
+    fi
+
     if [[ -n "$path" && -d "$path" ]]; then
       idx=$((idx + 1))
       printf '%s\t%s\t%s\n' "$idx" "$key" "$path" >> "$paths_file"
@@ -636,7 +1118,27 @@ choose_ext_interactive() {
     fi
   done < "$keys_file"
 
-  [[ -s "$paths_file" ]] || die "no extensions from $CV_BIN ext:list resolved to filesystem paths via $CV_BIN path -d"
+  # Fallback for CiviCRM Standalone/local installs where cv ext:list cannot resolve paths.
+  if [[ ! -s "$paths_file" && -s "$fs_file" ]]; then
+    while IFS=$'\t' read -r key name path; do
+      [[ -n "$key" && -n "$path" && -d "$path" ]] || continue
+
+      idx=$((idx + 1))
+      printf '%s\t%s\t%s\n' "$idx" "$key" "$path" >> "$paths_file"
+      printf '  %3d) %-45s %s\n' "$idx" "$key" "$path"
+    done < "$fs_file"
+  fi
+
+  [[ -s "$paths_file" ]] || {
+    err "Could not resolve extension paths automatically."
+    err ""
+    err "Use --ext directly instead:"
+    err ""
+    err "  export-searchkit scan --ext /var/www/html/ext/advanced-events"
+    err "  export-searchkit list --ext /var/www/html/ext/advanced-events"
+    err ""
+    die "no extensions resolved from cv or filesystem scan"
+  }
 
   say ""
   read -r -p "Choose extension number: " choice
@@ -656,6 +1158,259 @@ choose_ext_interactive() {
   say ""
 }
 
+api4_list_afforms() {
+  "$CV_BIN" api4 Afform.get \
+    select='["name","title","server_route"]' \
+    orderBy='{"name":"ASC"}' \
+    limit=0 2>/dev/null \
+    | php -r '
+      $raw = stream_get_contents(STDIN);
+      $d = json_decode($raw, true);
+      if (!is_array($d)) exit(0);
+
+      $rows = isset($d["values"]) ? $d["values"] : $d;
+
+      foreach ($rows as $row) {
+        if (empty($row["name"])) continue;
+
+        $name = $row["name"];
+        $title = isset($row["title"]) ? $row["title"] : "";
+        $route = isset($row["server_route"]) ? $row["server_route"] : "";
+
+        echo "afform:", $name, "\t", $name, "\t", $title, "\t", $route, PHP_EOL;
+      }
+    '
+}
+
+api4_list_saved_searches() {
+  "$CV_BIN" api4 SavedSearch.get \
+    select='["id","name","label","api_entity"]' \
+    orderBy='{"name":"ASC"}' \
+    limit=0 2>/dev/null \
+    | php -r '
+      $raw = stream_get_contents(STDIN);
+      $d = json_decode($raw, true);
+      if (!is_array($d)) exit(0);
+
+      $rows = isset($d["values"]) ? $d["values"] : $d;
+
+      foreach ($rows as $row) {
+        if (empty($row["id"]) || empty($row["name"])) continue;
+
+        $id = $row["id"];
+        $name = $row["name"];
+        $label = isset($row["label"]) ? $row["label"] : "";
+        $entity = isset($row["api_entity"]) ? $row["api_entity"] : "";
+
+        echo "ss:", $id, "\t", $name, "\t", $label, "\t", $entity, PHP_EOL;
+      }
+    '
+}
+
+api4_list_search_displays() {
+  "$CV_BIN" api4 SearchDisplay.get \
+    select='["id","name","label","type","saved_search_id.name"]' \
+    orderBy='{"saved_search_id.name":"ASC","name":"ASC"}' \
+    limit=0 2>/dev/null \
+    | php -r '
+      $raw = stream_get_contents(STDIN);
+      $d = json_decode($raw, true);
+      if (!is_array($d)) exit(0);
+
+      $rows = isset($d["values"]) ? $d["values"] : $d;
+
+      foreach ($rows as $row) {
+        if (empty($row["id"]) || empty($row["name"])) continue;
+
+        $id = $row["id"];
+        $name = $row["name"];
+        $label = isset($row["label"]) ? $row["label"] : "";
+        $type = isset($row["type"]) ? $row["type"] : "";
+        $search = isset($row["saved_search_id.name"]) ? $row["saved_search_id.name"] : "";
+
+        echo "sd:", $id, "\t", $name, "\t", $label, "\t", $type . " / " . $search, PHP_EOL;
+      }
+    '
+}
+
+choose_numbered_items() {
+  local source_file="$1"
+  local out_file="$2"
+  local title="$3"
+  local numbered_file="$TMPBASE/numbered-items.txt"
+  local choice
+  local part
+  local item
+  local max
+
+  : > "$out_file"
+  : > "$numbered_file"
+
+  if [[ ! -s "$source_file" ]]; then
+    say "No items found for: $title"
+    return 0
+  fi
+
+  say ""
+  say "$title"
+  say ""
+
+  awk -F '\t' '
+    {
+      idx++;
+      item=$1;
+      name=$2;
+      label=$3;
+      extra=$4;
+
+      printf "%s\t%s\n", idx, item >> numbered_file;
+
+      display = name;
+      if (label != "") {
+        display = display " — " label;
+      }
+      if (extra != "") {
+        display = display " [" extra "]";
+      }
+
+      printf "  %3d) %s\n", idx, display;
+    }
+  ' numbered_file="$numbered_file" "$source_file"
+
+  max="$(awk -F '\t' 'END {print $1 + 0}' "$numbered_file")"
+
+  say ""
+  say "Choose item number(s), comma-separated. Use 'all' for all, or 'q' to cancel."
+  read -r -p "Selection: " choice
+
+  case "$choice" in
+    q|Q|quit|QUIT|cancel|CANCEL)
+      say "Aborted."
+      exit 1
+      ;;
+    all|ALL)
+      awk -F '\t' '{print $2}' "$numbered_file" > "$out_file"
+      return 0
+      ;;
+  esac
+
+  choice="$(printf '%s' "$choice" | tr ',' ' ')"
+
+  for part in $choice; do
+    if ! [[ "$part" =~ ^[0-9]+$ ]]; then
+      die "invalid selection: $part"
+    fi
+
+    if [[ "$part" -lt 1 || "$part" -gt "$max" ]]; then
+      die "selection out of range: $part"
+    fi
+
+    item="$(awk -F '\t' -v n="$part" '$1 == n {print $2}' "$numbered_file")"
+    [[ -n "$item" ]] && printf '%s\n' "$item" >> "$out_file"
+  done
+
+  sort -u "$out_file" -o "$out_file"
+}
+
+choose_interactive_export_items() {
+  local out_file="$1"
+  local source_file="$TMPBASE/site-items.txt"
+  local choice
+
+  : > "$out_file"
+  : > "$source_file"
+
+  say "What do you want to export?"
+  say ""
+  say "  1) Discovered artifacts from this extension"
+  say "  2) Afforms available in this CiviCRM site"
+  say "  3) SavedSearches available in this CiviCRM site"
+  say "  4) SearchDisplays available in this CiviCRM site"
+  say "  5) All site Afforms and SavedSearches"
+  say "  6) All site Afforms, SavedSearches, and SearchDisplays advanced/manual"
+  say ""
+  read -r -p "Choose export source: " choice
+
+  case "$choice" in
+    1)
+      discover "$EXT" "$out_file"
+      ;;
+    2)
+      api4_list_afforms > "$source_file"
+      choose_numbered_items "$source_file" "$out_file" "Available Afforms"
+      ;;
+    3)
+      api4_list_saved_searches > "$source_file"
+      choose_numbered_items "$source_file" "$out_file" "Available SavedSearches"
+      ;;
+    4)
+      api4_list_search_displays > "$source_file"
+      choose_numbered_items "$source_file" "$out_file" "Available SearchDisplays"
+      ;;
+    5)
+      {
+        api4_list_afforms
+        api4_list_saved_searches
+      } > "$source_file"
+      choose_numbered_items "$source_file" "$out_file" "Available Afforms and SavedSearches"
+      ;;
+
+    6)
+      {
+        api4_list_afforms
+        api4_list_saved_searches
+        api4_list_search_displays
+      } > "$source_file"
+      choose_numbered_items "$source_file" "$out_file" "Available Afforms, SavedSearches, and SearchDisplays advanced/manual"
+      ;;
+
+    q|Q|quit|QUIT|cancel|CANCEL)
+      say "Aborted."
+      exit 1
+      ;;
+
+    *)
+      die "invalid export source: $choice"
+      ;;
+  esac
+}
+
+snapshot_files() {
+  local out="$1"
+
+  find "$EXT/managed" "$EXT/ang" -type f \
+    \( -name '*.mgd.php' -o -name '*.aff.php' -o -name '*.aff.html' \) \
+    -exec sha256sum {} \; 2>/dev/null \
+    | sed "s#  $EXT/#  #" \
+    | sort > "$out"
+}
+
+show_changed_since_snapshot() {
+  local before="$1"
+  local after="$2"
+
+  say ""
+
+  if git -C "$EXT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    say "Git changes after export:"
+    git -C "$EXT" status --short || true
+    say ""
+    say "Changed files:"
+    git -C "$EXT" diff --name-only || true
+    return 0
+  fi
+
+  snapshot_files "$after"
+
+  say "File changes after export:"
+  if diff -u "$before" "$after" >/dev/null 2>&1; then
+    say "  No file content changes detected."
+    say "  This means the exported files were already up to date."
+  else
+    comm -13 "$before" "$after" | awk "{print \"  changed/new: \" \$2}"
+  fi
+}
+
 normalize_argv() {
   local out=()
   local arg
@@ -673,7 +1428,15 @@ normalize_argv() {
         out+=(interactive)
         saw_command=1
         ;;
-      scan|list|doctor|export_items|export-items|interactive)
+      export-items)
+        out+=(export_items)
+        saw_command=1
+        ;;
+      self-test)
+        out+=(self_test)
+        saw_command=1
+        ;;
+      scan|list|doctor|export_items|interactive|examples|self_test)
         out+=("$arg")
         saw_command=1
         ;;
@@ -737,7 +1500,9 @@ COMMANDS:
   list          List discovered artifacts without exporting.
   doctor        Check environment and target extension.
   export_items  Export explicit items into target extension. [aliases: export-items]
-  interactive   Choose extension interactively, then export discovered artifacts.
+  interactive   Choose extension interactively, then choose artifacts from extension or site.
+  examples      Show common usage examples.
+  self_test     Run smoke tests for all main commands and options. [aliases: self-test]
 EOF
     exit
 }
@@ -749,7 +1514,7 @@ _argc_version() {
 
 _argc_parse() {
     local _argc_key _argc_action
-    local _argc_subcmds="scan, list, doctor, export_items, export-items, interactive"
+    local _argc_subcmds="scan, list, doctor, export_items, export-items, interactive, examples, self_test, self-test"
     while [[ $_argc_index -lt $_argc_len ]]; do
         _argc_item="${argc__args[_argc_index]}"
         _argc_key="${_argc_item%%=*}"
@@ -888,6 +1653,16 @@ _argc_parse() {
             _argc_action=_argc_parse_interactive
             break
             ;;
+        examples)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_examples
+            break
+            ;;
+        self_test | self-test)
+            _argc_index=$((_argc_index + 1))
+            _argc_action=_argc_parse_self_test
+            break
+            ;;
         help)
             local help_arg="${argc__args[$((_argc_index + 1))]:-}"
             case "$help_arg" in
@@ -905,6 +1680,12 @@ _argc_parse() {
                 ;;
             interactive)
                 _argc_usage_interactive
+                ;;
+            examples)
+                _argc_usage_examples
+                ;;
+            self_test | self-test)
+                _argc_usage_self_test
                 ;;
             "")
                 _argc_usage
@@ -1584,7 +2365,7 @@ _argc_parse_export_items() {
 
 _argc_usage_interactive() {
     cat <<-'EOF'
-Choose extension interactively, then export discovered artifacts.
+Choose extension interactively, then choose artifacts from extension or site.
 
 USAGE: export-searchkit interactive [OPTIONS]
 
@@ -1732,6 +2513,323 @@ _argc_parse_interactive() {
         argc__fn=interactive
         if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
             _argc_usage_interactive
+        fi
+    fi
+}
+
+_argc_usage_examples() {
+    cat <<-'EOF'
+Show common usage examples.
+
+USAGE: export-searchkit examples [OPTIONS]
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_examples() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_examples
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php find sed sort awk)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=examples
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_examples
+        fi
+    fi
+}
+
+_argc_usage_self_test() {
+    cat <<-'EOF'
+Run smoke tests for all main commands and options.
+
+USAGE: export-searchkit self_test [OPTIONS] [PATH]
+
+ARGS:
+  [PATH]  Path inside extension.
+
+OPTIONS:
+      --ext <PATH>   Target extension root, or any path inside the target extension.
+      --dry-run      Print commands without executing.
+  -v, --verbose      Show basic progress/info logs.
+      --debug        Show debug logs and save API JSON dumps. Also available as -vv.
+      --trace        Enable shell tracing. Also available as -vvv.
+      --keep-tmp     Keep temp files after exit.
+      --no-strict    Continue after export failures.
+  -y, --yes          Answer yes to prompts.
+  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -h, --help
+EOF
+    exit
+}
+
+_argc_parse_self_test() {
+    local _argc_key _argc_action
+    local _argc_subcmds=""
+    while [[ $_argc_index -lt $_argc_len ]]; do
+        _argc_item="${argc__args[_argc_index]}"
+        _argc_key="${_argc_item%%=*}"
+        case "$_argc_key" in
+        --help | -help | -h)
+            _argc_usage_self_test
+            ;;
+        --)
+            _argc_dash="${#argc__positionals[@]}"
+            argc__positionals+=("${argc__args[@]:$((_argc_index + 1))}")
+            _argc_index=$_argc_len
+            break
+            ;;
+        --ext)
+            _argc_take_args "--ext <PATH>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_ext:-}" ]]; then
+                argc_ext="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--ext\` cannot be used multiple times"
+            fi
+            ;;
+        --dry-run)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--dry-run\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_dry_run:-}" ]]; then
+                _argc_die "error: the argument \`--dry-run\` cannot be used multiple times"
+            else
+                argc_dry_run=1
+            fi
+            ;;
+        --verbose | -v)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--verbose\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_verbose:-}" ]]; then
+                _argc_die "error: the argument \`--verbose\` cannot be used multiple times"
+            else
+                argc_verbose=1
+            fi
+            ;;
+        --debug)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--debug\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_debug:-}" ]]; then
+                _argc_die "error: the argument \`--debug\` cannot be used multiple times"
+            else
+                argc_debug=1
+            fi
+            ;;
+        --trace)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--trace\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_trace:-}" ]]; then
+                _argc_die "error: the argument \`--trace\` cannot be used multiple times"
+            else
+                argc_trace=1
+            fi
+            ;;
+        --keep-tmp)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--keep-tmp\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_keep_tmp:-}" ]]; then
+                _argc_die "error: the argument \`--keep-tmp\` cannot be used multiple times"
+            else
+                argc_keep_tmp=1
+            fi
+            ;;
+        --no-strict)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-strict\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_strict:-}" ]]; then
+                _argc_die "error: the argument \`--no-strict\` cannot be used multiple times"
+            else
+                argc_no_strict=1
+            fi
+            ;;
+        --yes | -y)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--yes\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_yes:-}" ]]; then
+                _argc_die "error: the argument \`--yes\` cannot be used multiple times"
+            else
+                argc_yes=1
+            fi
+            ;;
+        --interactive | -i)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--interactive\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_interactive:-}" ]]; then
+                _argc_die "error: the argument \`--interactive\` cannot be used multiple times"
+            else
+                argc_interactive=1
+            fi
+            ;;
+        *)
+            if _argc_maybe_flag_option "-" "$_argc_item"; then
+                _argc_die "error: unexpected argument \`$_argc_key\` found"
+            fi
+            argc__positionals+=("$_argc_item")
+            _argc_index=$((_argc_index + 1))
+            ;;
+        esac
+    done
+    _argc_tools=(bash php find sed sort awk)
+    if [[ -n "${_argc_action:-}" ]]; then
+        $_argc_action
+    else
+        argc__fn=self_test
+        if [[ "${argc__positionals[0]:-}" == "help" ]] && [[ "${#argc__positionals[@]}" -eq 1 ]]; then
+            _argc_usage_self_test
+        fi
+        _argc_match_positionals 0
+        local values_index values_size
+        IFS=: read -r values_index values_size <<<"${_argc_match_positionals_values[0]:-}"
+        if [[ -n "$values_index" ]]; then
+            argc_path="${argc__positionals[values_index]}"
         fi
     fi
 }
