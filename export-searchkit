@@ -15,7 +15,7 @@
 # @flag --keep-tmp Keep temp files after exit.
 # @flag --no-strict Continue after export failures.
 # @flag -y --yes Answer yes to prompts.
-# @flag -i --interactive Choose extension interactively and export discovered artifacts.
+# @flag -i --interactive Choose extension interactively, then choose artifacts from extension or site.
 
 # @cmd Scan extension and export discovered Afform/SearchKit artifacts.
 # @arg path <PATH> Path inside extension.
@@ -114,37 +114,37 @@ examples() {
 export-searchkit examples
 
 Basic checks:
-  export-searchkit doctor --ext /var/www/html/ext/advanced-events
-  export-searchkit list --ext /var/www/html/ext/advanced-events
-  export-searchkit scan --dry-run --ext /var/www/html/ext/advanced-events
+  export-searchkit doctor --ext /var/www/html/ext/some-ext-name
+  export-searchkit list --ext /var/www/html/ext/some-ext-name
+  export-searchkit scan --dry-run --ext /var/www/html/ext/some-ext-name
 
 Export all discovered Afform, SavedSearch, and SearchDisplay artifacts:
-  export-searchkit scan --ext /var/www/html/ext/advanced-events
+  export-searchkit scan --ext /var/www/html/ext/some-ext-name
 
 Export and continue if one item fails:
-  export-searchkit scan --no-strict --ext /var/www/html/ext/advanced-events
+  export-searchkit scan --no-strict --ext /var/www/html/ext/some-ext-name
 
 Export one Afform:
-  export-searchkit export_items --ext /var/www/html/ext/advanced-events afform:afsearchManageEventTemplates
+  export-searchkit export_items --ext /var/www/html/ext/some-ext-name afform:afsearchManageEventTemplates
 
 Export SavedSearch/SearchDisplay by ID:
-  export-searchkit export_items --ext /var/www/html/ext/advanced-events ss:65 ss:66 sd:67 sd:68
+  export-searchkit export_items --ext /var/www/html/ext/some-ext-name ss:65 ss:66 sd:67 sd:68
 
 Dry-run scan:
-  export-searchkit --dry-run scan --ext /var/www/html/ext/advanced-events
-  export-searchkit scan --dry-run --ext /var/www/html/ext/advanced-events
+  export-searchkit --dry-run scan --ext /var/www/html/ext/some-ext-name
+  export-searchkit scan --dry-run --ext /var/www/html/ext/some-ext-name
 
 Dry-run explicit export:
-  export-searchkit --dry-run export_items --ext /var/www/html/ext/advanced-events \
+  export-searchkit --dry-run export_items --ext /var/www/html/ext/some-ext-name \
     afform:afsearchManageEventTemplates ss:65 sd:67
-  export-searchkit export_items --dry-run --ext /var/www/html/ext/advanced-events \
+  export-searchkit export_items --dry-run --ext /var/www/html/ext/some-ext-name \
     afform:afsearchManageEventTemplates ss:65 sd:67
 
 Debug export and keep temp logs:
-  export-searchkit --debug --keep-tmp scan --ext /var/www/html/ext/advanced-events
+  export-searchkit --debug --keep-tmp scan --ext /var/www/html/ext/some-ext-name
 
 Trace shell execution:
-  export-searchkit --trace --keep-tmp scan --ext /var/www/html/ext/advanced-events
+  export-searchkit --trace --keep-tmp scan --ext /var/www/html/ext/some-ext-name
 
 Interactive extension picker:
   export-searchkit interactive
@@ -161,7 +161,7 @@ Interactive picker with site artifact selection:
   #   3) item number(s), comma-separated, or all
 
 Run built-in smoke tests:
-  export-searchkit self_test --ext /var/www/html/ext/advanced-events
+  export-searchkit self_test --ext /var/www/html/ext/some-ext-name
 
 Supported item formats:
   afform:NAME     Example: afform:afsearchManageEventTemplates
@@ -211,6 +211,7 @@ self_test() {
   local path="${argc_path:-${argc_ext:-.}}"
   local tmp_root="${TMPDIR:-/tmp}"
   local out
+  local resolved_ext
 
   mkdir -p "$tmp_root" || die "cannot create temp directory: $tmp_root"
   out="$tmp_root/export-searchkit-self-test.$$.out"
@@ -224,6 +225,10 @@ self_test() {
     cat "$out"
     die "self-test failed: doctor did not report OK"
   }
+
+  resolved_ext="$(awk -F': ' '/^Extension:/ {print $2; exit}' "$out")"
+  [[ -n "$resolved_ext" ]] || die "self-test failed: could not read resolved extension path from doctor output"
+
   say "  PASS"
 
   say "Test 2: list"
@@ -334,7 +339,7 @@ self_test() {
     cat "$out"
     die "self-test failed: interactive did not print available extensions"
   }
-  grep -Fq "$path" "$out" || {
+  grep -Fq "$resolved_ext" "$out" || {
     cat "$out"
     die "self-test failed: interactive did not list target extension path"
   }
@@ -346,14 +351,14 @@ self_test() {
     cat "$out"
     die "self-test failed: -i did not print available extensions"
   }
-  grep -Fq "$path" "$out" || {
+  grep -Fq "$resolved_ext" "$out" || {
     cat "$out"
     die "self-test failed: -i did not list target extension path"
   }
   say "  PASS"
 
   local ext_choice
-  ext_choice="$(interactive_choice_for_path "$path")"
+  ext_choice="$(interactive_choice_for_path "$resolved_ext")"
 
   say "Test 13: interactive choose extension then cancel artifact picker"
   printf '%s\nq\n' "$ext_choice" | "$0" interactive > "$out" 2>&1 || true
@@ -545,7 +550,14 @@ resolve_ext() {
   abs="$(abs_path "$hint")"
   root="$(find_ext_root "$abs" || true)"
 
-  [[ -n "$root" ]] || die "could not find extension root by walking up from: $abs"
+  [[ -n "$root" ]] || die "could not find extension root by walking up from: $abs
+
+Use --ext with a CiviCRM extension path, for example:
+  export-searchkit doctor --ext sites/default/civicrm-extend/com.example.ext
+  export-searchkit doctor --ext web/sites/default/civicrm-extend/com.example.ext
+  export-searchkit doctor --ext wp-content/civicrm-extend/com.example.ext
+  export-searchkit doctor --ext web/wp-content/civicrm-extend/com.example.ext
+  export-searchkit interactive"
 
   EXT="$root"
 
@@ -977,19 +989,52 @@ list_ext_keys() {
 find_ext_path_by_key() {
   local key="$1"
   local project_root
+  local parent_root
   local d
   local info_key
 
   project_root="$(find_project_root "$PWD" || true)"
   [[ -n "$project_root" ]] || return 1
 
+  parent_root="$(dirname "$project_root")"
+
   for d in \
     "$project_root/ext/$key" \
     "$project_root/ext/${key//_/-}" \
+    "$project_root/extensions/$key" \
+    "$project_root/extensions/${key//_/-}" \
+    "$project_root/civicrm/ext/$key" \
+    "$project_root/civicrm/ext/${key//_/-}" \
+    "$project_root/private/civicrm/ext/$key" \
+    "$project_root/private/civicrm/ext/${key//_/-}" \
     "$project_root/web/sites/default/files/civicrm/ext/$key" \
     "$project_root/web/sites/default/files/civicrm/ext/${key//_/-}" \
     "$project_root/sites/default/files/civicrm/ext/$key" \
-    "$project_root/sites/default/files/civicrm/ext/${key//_/-}"
+    "$project_root/sites/default/files/civicrm/ext/${key//_/-}" \
+    "$project_root/web/sites/default/civicrm-extend/$key" \
+    "$project_root/web/sites/default/civicrm-extend/${key//_/-}" \
+    "$project_root/sites/default/civicrm-extend/$key" \
+    "$project_root/sites/default/civicrm-extend/${key//_/-}" \
+    "$project_root/web/wp-content/civicrm-extend/$key" \
+    "$project_root/web/wp-content/civicrm-extend/${key//_/-}" \
+    "$project_root/wp-content/civicrm-extend/$key" \
+    "$project_root/wp-content/civicrm-extend/${key//_/-}" \
+    "$project_root/web/wp-content/plugins/$key" \
+    "$project_root/web/wp-content/plugins/${key//_/-}" \
+    "$project_root/wp-content/plugins/$key" \
+    "$project_root/wp-content/plugins/${key//_/-}" \
+    "$parent_root/ext/$key" \
+    "$parent_root/ext/${key//_/-}" \
+    "$parent_root/extensions/$key" \
+    "$parent_root/extensions/${key//_/-}" \
+    "$parent_root/web/sites/default/civicrm-extend/$key" \
+    "$parent_root/web/sites/default/civicrm-extend/${key//_/-}" \
+    "$parent_root/sites/default/civicrm-extend/$key" \
+    "$parent_root/sites/default/civicrm-extend/${key//_/-}" \
+    "$parent_root/web/wp-content/civicrm-extend/$key" \
+    "$parent_root/web/wp-content/civicrm-extend/${key//_/-}" \
+    "$parent_root/wp-content/civicrm-extend/$key" \
+    "$parent_root/wp-content/civicrm-extend/${key//_/-}"
   do
     [[ -d "$d" ]] && {
       printf '%s\n' "$d"
@@ -1015,7 +1060,13 @@ find_ext_path_by_key() {
       return 0
     fi
   done < <(
-    find "$project_root" -path '*/vendor' -prune -o -path '*/node_modules' -prune -o -name info.xml -print 2>/dev/null \
+    find "$project_root" "$parent_root" \
+      -path '*/vendor' -prune -o \
+      -path '*/node_modules' -prune -o \
+      -path '*/.git' -prune -o \
+      -path '*/wp-content/uploads' -prune -o \
+      -path '*/sites/default/files' -prune -o \
+      -name info.xml -print 2>/dev/null \
       | sed 's#/info.xml$##'
   )
 
@@ -1024,57 +1075,116 @@ find_ext_path_by_key() {
 
 list_filesystem_extensions() {
   local project_root="$1"
+  local parent_root
   local base
   local ext_dir
   local key
   local name
+  local configured_dir
 
-  for base in \
-    "$project_root/ext" \
-    "$project_root/web/sites/default/files/civicrm/ext" \
-    "$project_root/sites/default/files/civicrm/ext"
-  do
-    [[ -d "$base" ]] || continue
+  parent_root="$(dirname "$project_root")"
 
-    find "$base" -mindepth 1 -maxdepth 1 -type d | sort | while IFS= read -r ext_dir; do
-      [[ -f "$ext_dir/info.xml" || -d "$ext_dir/managed" || -d "$ext_dir/ang" ]] || continue
+  configured_dir="$(
+    "$CV_BIN" php:eval '
+      $dirs = Civi::settings()->get("extensionsDir");
+      foreach ((array) $dirs as $dir) {
+        if (is_string($dir) && $dir !== "") {
+          echo $dir, PHP_EOL;
+        }
+      }
+    ' 2>/dev/null || true
+  )"
 
-      key="$(
-        php -r '
-          $dir = $argv[1];
-          $info = $dir . "/info.xml";
+  {
+    while IFS= read -r base; do
+      [[ -n "$base" ]] || continue
 
-          if (is_file($info)) {
-            $xml = @simplexml_load_file($info);
-            if ($xml && isset($xml["key"])) {
-              echo (string) $xml["key"];
-              exit(0);
-            }
+      if [[ "$base" == /* ]]; then
+        printf '%s\n' "$base"
+      else
+        printf '%s\n' "$PWD/$base"
+        printf '%s\n' "$project_root/$base"
+        printf '%s\n' "$parent_root/$base"
+      fi
+    done <<< "$configured_dir"
+
+    printf '%s\n' \
+      "$project_root/ext" \
+      "$project_root/extensions" \
+      "$project_root/civicrm/ext" \
+      "$project_root/private/civicrm/ext" \
+      "$project_root/web/sites/default/files/civicrm/ext" \
+      "$project_root/sites/default/files/civicrm/ext" \
+      "$project_root/web/sites/default/civicrm-extend" \
+      "$project_root/sites/default/civicrm-extend" \
+      "$project_root/web/modules/custom" \
+      "$project_root/web/modules/contrib" \
+      "$project_root/modules/custom" \
+      "$project_root/modules/contrib" \
+      "$project_root/web/wp-content/civicrm-extend" \
+      "$project_root/wp-content/civicrm-extend" \
+      "$project_root/web/wp-content/plugins" \
+      "$project_root/wp-content/plugins" \
+      "$parent_root/ext" \
+      "$parent_root/extensions" \
+      "$parent_root/civicrm/ext" \
+      "$parent_root/private/civicrm/ext" \
+      "$parent_root/web/sites/default/files/civicrm/ext" \
+      "$parent_root/sites/default/files/civicrm/ext" \
+      "$parent_root/web/sites/default/civicrm-extend" \
+      "$parent_root/sites/default/civicrm-extend" \
+      "$parent_root/web/wp-content/civicrm-extend" \
+      "$parent_root/wp-content/civicrm-extend" \
+      "$parent_root/web/wp-content/plugins" \
+      "$parent_root/wp-content/plugins"
+
+    find "$project_root" "$parent_root" \
+      -path '*/vendor' -prune -o \
+      -path '*/node_modules' -prune -o \
+      -path '*/.git' -prune -o \
+      -path '*/wp-content/uploads' -prune -o \
+      -path '*/sites/default/files' -prune -o \
+      -name info.xml -print 2>/dev/null \
+      | sed 's#/info.xml$##'
+  } | sed '/^[[:space:]]*$/d' | sort -u | while IFS= read -r ext_dir; do
+    [[ -d "$ext_dir" ]] || continue
+    [[ -f "$ext_dir/info.xml" || -d "$ext_dir/managed" || -d "$ext_dir/ang" ]] || continue
+
+    key="$(
+      php -r '
+        $dir = $argv[1];
+        $info = $dir . "/info.xml";
+
+        if (is_file($info)) {
+          $xml = @simplexml_load_file($info);
+          if ($xml && isset($xml["key"])) {
+            echo (string) $xml["key"];
+            exit(0);
           }
+        }
 
-          echo basename($dir);
-        ' "$ext_dir" 2>/dev/null || basename "$ext_dir"
-      )"
+        echo basename($dir);
+      ' "$ext_dir" 2>/dev/null || basename "$ext_dir"
+    )"
 
-      name="$(
-        php -r '
-          $dir = $argv[1];
-          $info = $dir . "/info.xml";
+    name="$(
+      php -r '
+        $dir = $argv[1];
+        $info = $dir . "/info.xml";
 
-          if (is_file($info)) {
-            $xml = @simplexml_load_file($info);
-            if ($xml && isset($xml->name)) {
-              echo trim((string) $xml->name);
-              exit(0);
-            }
+        if (is_file($info)) {
+          $xml = @simplexml_load_file($info);
+          if ($xml && isset($xml->name)) {
+            echo trim((string) $xml->name);
+            exit(0);
           }
+        }
 
-          echo basename($dir);
-        ' "$ext_dir" 2>/dev/null || basename "$ext_dir"
-      )"
+        echo basename($dir);
+      ' "$ext_dir" 2>/dev/null || basename "$ext_dir"
+    )"
 
-      printf '%s\t%s\t%s\n' "$key" "$name" "$ext_dir"
-    done
+    printf '%s\t%s\t%s\n' "$key" "$name" "$ext_dir"
   done | sort -u
 }
 
@@ -1134,8 +1244,8 @@ choose_ext_interactive() {
     err ""
     err "Use --ext directly instead:"
     err ""
-    err "  export-searchkit scan --ext /var/www/html/ext/advanced-events"
-    err "  export-searchkit list --ext /var/www/html/ext/advanced-events"
+    err "  export-searchkit scan --ext /var/www/html/ext/some-ext-name"
+    err "  export-searchkit list --ext /var/www/html/ext/some-ext-name"
     err ""
     die "no extensions resolved from cv or filesystem scan"
   }
@@ -1491,7 +1601,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help         Print help
   -V, --version      Print version
 
@@ -1729,7 +1839,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit
@@ -1892,7 +2002,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit
@@ -2055,7 +2165,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit
@@ -2218,7 +2328,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit
@@ -2378,7 +2488,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit
@@ -2532,7 +2642,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit
@@ -2689,7 +2799,7 @@ OPTIONS:
       --keep-tmp     Keep temp files after exit.
       --no-strict    Continue after export failures.
   -y, --yes          Answer yes to prompts.
-  -i, --interactive  Choose extension interactively and export discovered artifacts.
+  -i, --interactive  Choose extension interactively, then choose artifacts from extension or site.
   -h, --help
 EOF
     exit

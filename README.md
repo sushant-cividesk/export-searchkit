@@ -62,6 +62,16 @@ Artifacts:
   - ss-name:Event_Templates
 ```
 
+Basic checks:
+
+```sh
+  export-searchkit doctor --ext /var/www/html/ext/some-ext-name
+  export-searchkit doctor --ext sites/default/civicrm-extend/com.example.ext
+  export-searchkit doctor --ext wp-content/civicrm-extend/com.example.ext
+  export-searchkit list --ext /var/www/html/ext/some-ext-name
+  export-searchkit scan --dry-run --ext /var/www/html/ext/some-ext-name
+```
+
 ### 2. Resolves SavedSearch/SearchDisplay IDs automatically
 
 For SavedSearch and SearchDisplay names, it uses `cv api4` to resolve IDs:
